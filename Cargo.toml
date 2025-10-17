@@ -1,5 +1,5 @@
 [package]
-name = "EMAIL_DETECTOR_RUST"
+name = "EMAIL_DETECTOR"
 version = "0.1.0"
 edition = "2024"
 
