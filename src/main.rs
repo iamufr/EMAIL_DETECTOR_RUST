@@ -7,11 +7,11 @@ use std::time::Instant;
 // INTERFACES (SOLID: Interface Segregation Principle)
 // ============================================================================
 
-trait EmailValidator: Send {
+trait EmailValidator: Send + Sync {
     fn is_valid(&self, email: &str) -> bool;
 }
 
-trait EmailScanner: Send {
+trait EmailScanner: Send + Sync {
     fn contains(&self, text: &str) -> bool;
     fn extract(&self, text: &str) -> Vec<String>;
 }
@@ -335,7 +335,10 @@ impl DomainPartValidator {
             return false;
         }
 
-        if end - start > 6 && &text[ip_start..ip_start + 5] == b"IPv6:" {
+        if end - start > 6
+            && ip_start + 5 <= text.len()
+            && &text[ip_start..ip_start + 5] == b"IPv6:"
+        {
             return Self::validate_ipv6(text, ip_start + 5, ip_end);
         }
 
@@ -367,12 +370,16 @@ impl DomainPartValidator {
                     if !CharacterClassifier::is_digit(text[j]) {
                         return false;
                     }
-                    octet = octet * 10 + (text[j] - b'0') as u32;
+
+                    match octet
+                        .checked_mul(10)
+                        .and_then(|v| v.checked_add((text[j] - b'0') as u32))
+                    {
+                        Some(new_octet) if new_octet <= 255 => octet = new_octet,
+                        _ => return false,
+                    }
                 }
 
-                if octet > 255 {
-                    return false;
-                }
                 octets.push(octet);
                 num_start = i + 1;
             }
@@ -1343,6 +1350,12 @@ fn run_text_scanning_tests() {
             should_find: true,
             expected_emails: vec!["valid@domain.com".to_string()],
             description: "Multiple @ characters".to_string(),
+        },
+        ScanTestCase {
+            input: "user@[4294967296.0.0.1]".to_string(),
+            should_find: false,
+            expected_emails: vec![],
+            description: "Invalid Domain".to_string(),
         },
         ScanTestCase {
             input: "text###@@@user@domain.com".to_string(),
