@@ -992,6 +992,11 @@ fn run_exact_validation_tests() {
             expected: true,
             description: "Plus sign (Gmail filters)".to_string(),
         },
+        TestCase {
+            input: "user@domain".to_string(),
+            expected: true,
+            description: "Single-label domain (valid in RFC 5321)".to_string(),
+        },
         // RFC 5322 special characters
         TestCase {
             input: "user!test@example.com".to_string(),
@@ -1073,7 +1078,7 @@ fn run_exact_validation_tests() {
             expected: true,
             description: "Tilde".to_string(),
         },
-        // Quoted strings (NEW: Now supported!)
+        // Quoted strings
         TestCase {
             input: "\"user\"@example.com".to_string(),
             expected: true,
@@ -1104,67 +1109,102 @@ fn run_exact_validation_tests() {
             expected: true,
             description: "Escaped backslash".to_string(),
         },
-        // IP literals (NEW: Now supported!)
+        // IPv4 tests
         TestCase {
             input: "user@[192.168.1.1]".to_string(),
             expected: true,
             description: "IPv4 literal".to_string(),
         },
         TestCase {
-            input: "user@[IPv6:2001:db8::1]".to_string(),
+            input: "user@[10.1.2.3]".to_string(),
             expected: true,
-            description: "IPv6 literal".to_string(),
+            description: "IPv4 Leading Zeros in the IP".to_string(),
         },
         TestCase {
-            input: "user@[2001:db8::1]".to_string(),
+            input: "admin@[192.168.1.1]".to_string(),
             expected: true,
-            description: "IPv6 literal".to_string(),
+            description: "IPv4 Leading Zeros in the IP".to_string(),
+        },
+        TestCase {
+            input: "root@[0.0.0.0]".to_string(),
+            expected: true,
+            description: "IPv4 Boundary IP Address".to_string(),
+        },
+        TestCase {
+            input: "broadcast@[255.255.255.255]".to_string(),
+            expected: true,
+            description: "IPv4 Boundary IP Address".to_string(),
+        },
+        TestCase {
+            input: "loopback@[127.0.0.1]".to_string(),
+            expected: true,
+            description: "IPv4 Boundary IP Address".to_string(),
+        },
+        TestCase {
+            input: r#""spaces are allowed"@[10.1.2.3]"#.to_string(), // C++: R"("spaces are allowed"@[10.1.2.3])"
+            expected: true,
+            description: "IPv4 with space in local-part inside quotes".to_string(),
         },
         TestCase {
             input: "test@[10.0.0.1]".to_string(),
             expected: true,
             description: "Private IPv4".to_string(),
         },
-        TestCase {
-            input: "user@[fe80::1]".to_string(),
-            expected: true,
-            description: "IPv6 link-local".to_string(),
-        },
-        TestCase {
-            input: "user@[::1]".to_string(),
-            expected: true,
-            description: "IPv6 loopback".to_string(),
-        },
         // IPv6 tests
         TestCase {
-            input: "user@[::1]".to_string(),
-            expected: true,
-            description: "IPv6 loopback".to_string(),
-        },
-        TestCase {
-            input: "user@[::]".to_string(),
+            input: "user@[IPv6::]".to_string(),
             expected: true,
             description: "IPv6 all zeros".to_string(),
         },
         TestCase {
-            input: "user@[2001:db8::]".to_string(),
+            input: "user@[IPv6::1]".to_string(),
+            expected: true,
+            description: "IPv6 loopback".to_string(),
+        },
+        TestCase {
+            input: "user@[IPv6:fe80::1]".to_string(),
+            expected: true,
+            description: "IPv6 link-local".to_string(),
+        },
+        TestCase {
+            input: "user@[IPv6:2001:db8::]".to_string(),
             expected: true,
             description: "IPv6 trailing compression".to_string(),
         },
         TestCase {
-            input: "user@[::ffff:192.0.2.1]".to_string(),
+            input: "user@[IPv6:2001:db8::1]".to_string(),
+            expected: true,
+            description: "IPv6 trailing compression".to_string(),
+        },
+        TestCase {
+            input: "user@[IPv6::ffff:192.0.2.1]".to_string(),
             expected: true,
             description: "IPv4-mapped IPv6".to_string(),
         },
         TestCase {
-            input: "user@[2001:db8:85a3::8a2e:370:7334]".to_string(),
+            input: "user@[IPv6:ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff]".to_string(),
+            expected: true,
+            description: "IPv6".to_string(),
+        },
+        TestCase {
+            input: "user@[IPv6:2001:db8:85a3::8a2e:370:7334]".to_string(),
             expected: true,
             description: "IPv6 with compression".to_string(),
         },
         TestCase {
-            input: "user@[2001:0db8:0000:0000:0000:ff00:0042:8329]".to_string(),
+            input: "user@[IPv6:2001:db8:85a3::8a2e:0370:7334:123]".to_string(),
+            expected: true,
+            description: "IPv6 full form with prefix".to_string(),
+        },
+        TestCase {
+            input: "user@[IPv6:2001:0db8:0000:0000:0000:ff00:0042:8329]".to_string(),
             expected: true,
             description: "IPv6 full form".to_string(),
+        },
+        TestCase {
+            input: "alice@[IPv6:::1]".to_string(),
+            expected: true,
+            description: "IPv6 loopback with prefix (appears as ::: but is valid)".to_string(),
         },
         // Domain variations
         TestCase {
@@ -1229,11 +1269,6 @@ fn run_exact_validation_tests() {
             description: "Double @".to_string(),
         },
         TestCase {
-            input: "user@domain".to_string(),
-            expected: false,
-            description: "Missing TLD".to_string(),
-        },
-        TestCase {
             input: "user@.domain.com".to_string(),
             expected: false,
             description: "Domain starts with dot".to_string(),
@@ -1293,6 +1328,204 @@ fn run_exact_validation_tests() {
             expected: false,
             description: "Invalid IPv6 (bad hex)".to_string(),
         },
+        TestCase {
+            input: "frank@[256.100.50.25]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (256 is outside the 0–255 range)".to_string(),
+        },
+        TestCase {
+            input: "gina@[192.168.1]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (Only three octets — requires four)".to_string(),
+        },
+        TestCase {
+            input: "hank@[192.168.1.999]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (octet out of range)".to_string(),
+        },
+        TestCase {
+            input: "ian@[192.168.1.-1]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (negative octet not allowed)".to_string(),
+        },
+        TestCase {
+            input: "a@[192.168.1.1.1]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (too many octets)".to_string(),
+        },
+        TestCase {
+            input: "b@[192..168.1.1]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (empty octet / consecutive dots)".to_string(),
+        },
+        TestCase {
+            input: "c@[300.1.1.1]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (octet > 255)".to_string(),
+        },
+        TestCase {
+            input: "d@[192.168.1.]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (trailing dot / missing octet)".to_string(),
+        },
+        TestCase {
+            input: "e@[192.168.01A.1]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (non-digit characters in octet)".to_string(),
+        },
+        TestCase {
+            input: "f@[192.168.1.256]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (octet > 255)".to_string(),
+        },
+        TestCase {
+            input: "g@[192.168.1. 1]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (space inside address-literal)".to_string(),
+        },
+        TestCase {
+            input: "j@[]".to_string(),
+            expected: false,
+            description: "Invalid domain-literal (empty brackets)".to_string(),
+        },
+        TestCase {
+            input: "k@[.192.168.1.1]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (leading dot inside literal)".to_string(),
+        },
+        TestCase {
+            input: "l@[192.168.1.1\n]".to_string(),
+            expected: false,
+            description: "Invalid IPv4 (control/newline character inside literal)".to_string(),
+        },
+        TestCase {
+            input: "alice@[IPv6::::1]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (actual triple-colon in address)".to_string(),
+        },
+        TestCase {
+            input: "bob@[IPv6:2001:db8::gggg]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (IPv6 uses 0-9 and a-f)".to_string(),
+        },
+        TestCase {
+            input: "carol@[IPv6:2001:0db8:85a3:0000:8a2e:0370:7334:12345]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (hextet longer than 4 hex digits)".to_string(),
+        },
+        TestCase {
+            input: "dave@[2001:db8::1]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (Missing the ' IPv6 : ' prefix inside the brackets)"
+                .to_string(),
+        },
+        TestCase {
+            input: "m@[IPv6::::1]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (four colons in a row)".to_string(),
+        },
+        TestCase {
+            input: "n@[IPv6:2001:db8:85a3:0:0:8a2e:370:7334:ffff]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (too many hextets — more than 8)".to_string(),
+        },
+        TestCase {
+            input: "o@[IPv6:2001:db8::gggg]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (non-hex characters in hextet)".to_string(),
+        },
+        TestCase {
+            input: "p@[IPv6:2001:0db8:85a3:0000:8a2e:0370:7334:12345]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (hextet length > 4)".to_string(),
+        },
+        TestCase {
+            input: "q@[IPv6:2001:db8::85a3::1]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (multiple '::' occurrences)".to_string(),
+        },
+        TestCase {
+            input: "r@[IPv6:2001:db8:85a3:0:0:8a2e:370:7334:]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (trailing colon)".to_string(),
+        },
+        TestCase {
+            input: "s@[2001:db8::1]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (missing required 'IPv6:' tag in address-literal)"
+                .to_string(),
+        },
+        TestCase {
+            input: "t@[IPv6:::ffff:300.1.1.1]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (embedded IPv4 octet 300 out of range)".to_string(),
+        },
+        TestCase {
+            input: "u@[IPv6:2001:db8:85a3::8a2e:0370:7334::]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (misused/trailing '::' / multiple '::')".to_string(),
+        },
+        TestCase {
+            input: "v@[IPv6:2001:db8:85a3:z:8a2e:370:7334]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (illegal character 'z' in hextet)".to_string(),
+        },
+        TestCase {
+            input: "w@[IPv6:]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (empty IPv6 literal)".to_string(),
+        },
+        TestCase {
+            input: "x@[IPv6:fe80::%eth0]".to_string(),
+            expected: false,
+            description: "Invalid IPv6 (zone/index identifier not allowed in SMTP address-literal)"
+                .to_string(),
+        },
+        TestCase {
+            input: "user@[::]".to_string(),
+            expected: false,
+            description: "IPv6 all zeros without prefix".to_string(),
+        },
+        TestCase {
+            input: "user@[2001:db8::1]".to_string(),
+            expected: false,
+            description: "IPv6 literal without prefix".to_string(),
+        },
+        TestCase {
+            input: "user@[fe80::1]".to_string(),
+            expected: false,
+            description: "IPv6 link-local without prefix".to_string(),
+        },
+        TestCase {
+            input: "user@[456.789.012.123]".to_string(),
+            expected: false,
+            description: "Invalid (IPv4 literal, octets > 255)".to_string(),
+        },
+        TestCase {
+            input: "user@[::1]".to_string(),
+            expected: false,
+            description: "IPv6 loopback without prefix".to_string(),
+        },
+        TestCase {
+            input: "user@[2001:db8::]".to_string(),
+            expected: false,
+            description: "IPv6 trailing compression without prefix".to_string(),
+        },
+        TestCase {
+            input: "user@[::ffff:192.0.2.1]".to_string(),
+            expected: false,
+            description: "IPv4-mapped IPv6 without prefix".to_string(),
+        },
+        TestCase {
+            input: "user@[2001:db8:85a3::8a2e:370:7334]".to_string(),
+            expected: false,
+            description: "IPv6 with compression without prefix".to_string(),
+        },
+        TestCase {
+            input: "user@[2001:0db8:0000:0000:0000:ff00:0042:8329]".to_string(),
+            expected: false,
+            description: "IPv6 full form without prefix".to_string(),
+        },
     ];
 
     let mut passed = 0;
@@ -1338,9 +1571,23 @@ fn run_text_scanning_tests() {
 
     let scanner = EmailValidatorFactory::create_scanner();
 
+    let json_string = r#"{
+        "type": "service_account",
+        "project_id": "your-gcp-project-12345",
+        "private_key_id": "a1b2c3d4e5f67890abcdef1234567890abcdef12",
+        "private_key": "-----BEGIN PRIVATE KEY-----\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQD... (long key content) ...\n-----END PRIVATE KEY-----\n",
+        "client_email": "my-service-account@your-gcp-project-12345.iam.gserviceaccount.com",
+        "client_id": "123456789012345678901",
+        "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+        "token_uri": "https://oauth2.googleapis.com/token",
+        "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+        "client_x509_cert_url": "https://www.googleapis.com/robot/v1/metadata/x509/my-service-account%40your-gcp-project-12345.iam.gserviceaccount.com"
+    }"#;
+
     let tests = vec![
+        // Multiple consecutive invalid characters
         ScanTestCase {
-            input: "aaaaaaaaaaaaaaaaaaaa@example.com".to_string(),
+            input: "aaaaaaaaaaaaaaaaaaaa@example.com".to_string(), // std::string(20, 'a')
             should_find: true,
             expected_emails: vec!["aaaaaaaaaaaaaaaaaaaa@example.com".to_string()],
             description: "long valid email".to_string(),
@@ -1366,11 +1613,11 @@ fn run_text_scanning_tests() {
         ScanTestCase {
             input: "text@user.com@domain.".to_string(),
             should_find: true,
-            expected_emails: vec!["text@user.com".to_string()],
+            expected_emails: vec!["text@user.com".to_string(), "user.com@domain".to_string()],
             description: "Legal email before second @".to_string(),
         },
         ScanTestCase {
-            input: "text@user.com@domain.in".to_string(),
+            input: "text@user.com@domain.in.".to_string(),
             should_find: true,
             expected_emails: vec!["text@user.com".to_string(), "user.com@domain.in".to_string()],
             description: "Two legal emails".to_string(),
@@ -1392,6 +1639,12 @@ fn run_text_scanning_tests() {
             should_find: false,
             expected_emails: vec![],
             description: "Only dots before @".to_string(),
+        },
+        ScanTestCase {
+            input: "In this paragraph there are some emails \"user@internal\"@example.com please find out them...!".to_string(),
+            should_find: true,
+            expected_emails: vec!["user@internal".to_string(), "\"user@internal\"@example.com".to_string()],
+            description: "@ inside double quotes allowed in Local Part".to_string(),
         },
         ScanTestCase {
             input: "user@domain.com@".to_string(),
@@ -1424,7 +1677,7 @@ fn run_text_scanning_tests() {
             description: "Find the alphabet or dight if any invalid special character found before @ if no alphabet found then consider legal special character".to_string(),
         },
 
-        // Valid Special Characters just before @
+        // Valid Special Characters just befor @
         ScanTestCase {
             input: "user!@domain.com".to_string(),
             should_find: true,
@@ -1540,7 +1793,7 @@ fn run_text_scanning_tests() {
             description: "~ before @ is legal according to RFC rule".to_string(),
         },
 
-        // Invalid Special Characters just before @
+        // InValid Special Characters just befor @
         ScanTestCase {
             input: "user @domain.com".to_string(),
             should_find: false,
@@ -1644,7 +1897,7 @@ fn run_text_scanning_tests() {
             description: "TAB is illegal (control/whitespace characters are not allowed)".to_string(),
         },
 
-        // Multiple Valid emails together — first valid, second valid
+        // Multiple Valid emails together — first valid, second valid (legal special character or characters before @)
         ScanTestCase {
             input: "text123@user.com!@domain.in".to_string(),
             should_find: true,
@@ -1874,7 +2127,7 @@ fn run_text_scanning_tests() {
             description: "'~~' before @ is legal (atext); second local-part is 'com~' which is RFC-valid".to_string(),
         },
 
-        // Multiple invalid emails together — first valid, second invalid
+        // Multiple invalid emails together — first valid, second invalid (illegal before @)
         ScanTestCase {
             input: "text@user.com @domain.in".to_string(),
             should_find: true,
@@ -1982,67 +2235,67 @@ fn run_text_scanning_tests() {
         ScanTestCase {
             input: "In this paragraph there are some emails first@domain.com#@second!@test.org!@alpha.in please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["first@domain.com".to_string(), "second!@test.org".to_string(), "test.org!@alpha.in".to_string()],
+            expected_emails: vec!["first@domain.com".to_string(), "domain.com#@second".to_string(), "second!@test.org".to_string(), "test.org!@alpha.in".to_string()],
             description: "Each local-part contains valid atext characters ('#', '!') before '@' — all RFC 5322 compliant".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails alice@company.net+@bob$@service.co$@example.org please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["alice@company.net".to_string(), "bob$@service.co".to_string(), "service.co$@example.org".to_string()],
+            expected_emails: vec!["alice@company.net".to_string(), "company.net+@bob".to_string(), "bob$@service.co".to_string(), "service.co$@example.org".to_string()],
             description: "Multiple addresses joined; '+', '$' are legal atext characters in local-part".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails one.user@site.com*@two#@host.org*@third-@example.io please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["one.user@site.com".to_string(), "two#@host.org".to_string(), "third-@example.io".to_string()],
+            expected_emails: vec!["one.user@site.com".to_string(), "site.com*@two".to_string(), "two#@host.org".to_string(), "host.org*@third".to_string(), "third-@example.io".to_string()],
             description: "Each local-part uses legal atext chars ('*', '#', '-') before '@'".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails foo@bar.com!!@baz##@qux$$@quux.in please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["foo@bar.com".to_string(), "qux$$@quux.in".to_string()],
+            expected_emails: vec!["foo@bar.com".to_string(), "bar.com!!@baz".to_string(), "baz##@qux".to_string(), "qux$$@quux.in".to_string()],
             description: "Double consecutive legal characters ('!!', '##', '$$') are RFC-valid though uncommon".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails alpha@beta.com+*@gamma/delta.com+*@eps-@zeta.co please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["alpha@beta.com".to_string(), "eps-@zeta.co".to_string()],
+            expected_emails: vec!["alpha@beta.com".to_string(), "beta.com+*@gamma".to_string(), "gamma/delta.com+*@eps".to_string(), "eps-@zeta.co".to_string()],
             description: "Mix of valid symbols '+', '*', '/', '-' in local-parts — all atext-legal".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails u1@d1.org^@u2_@d2.net`@u3{@d3.io please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["u1@d1.org".to_string(), "u2_@d2.net".to_string(), "u3{@d3.io".to_string()],
+            expected_emails: vec!["u1@d1.org".to_string(), "d1.org^@u2".to_string(), "u2_@d2.net".to_string(), "d2.net`@u3".to_string(), "u3{@d3.io".to_string()],
             description: "Local-parts include '^', '_', '`', '{' — all RFC-allowed characters".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails name@dom.com|@name2@dom2.com|@name3~@dom3.org please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["name@dom.com".to_string(), "name2@dom2.com".to_string(), "name3~@dom3.org".to_string()],
+            expected_emails: vec!["name@dom.com".to_string(), "dom.com|@name2".to_string(), "name2@dom2.com".to_string(), "dom2.com|@name3".to_string(), "name3~@dom3.org".to_string()],
             description: "Legal special chars ('|', '~') appear before '@' — still RFC-valid".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails me.last@my.org-@you+@your.org-@them*@their.io please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["me.last@my.org".to_string(), "you+@your.org".to_string(), "them*@their.io".to_string()],
+            expected_emails: vec!["me.last@my.org".to_string(), "my.org-@you".to_string(), "you+@your.org".to_string(), "your.org-@them".to_string(), "them*@their.io".to_string()],
             description: "Combination of '-', '+', '*' in local-part are permitted under RFC 5322".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails p@q.com=@r#@s$@t%u.org please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["p@q.com".to_string()],
+            expected_emails: vec!["p@q.com".to_string(), "q.com=@r".to_string(), "r#@s".to_string(), "s$@t".to_string()],
             description: "Chained valid addresses with '=', '#', '$', '%' — all within atext definition".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails first@domain.com++@second@test.org--@alpha~~@beta.in please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["first@domain.com".to_string(), "second@test.org".to_string(), "alpha~~@beta.in".to_string()],
+            expected_emails: vec!["first@domain.com".to_string(), "domain.com++@second".to_string(), "second@test.org".to_string(), "test.org--@alpha".to_string(), "alpha~~@beta.in".to_string()],
             description: "Valid plus, dash, and tilde used before '@'; RFC 5322-legal though rarely used".to_string(),
         },
         ScanTestCase {
             input: "In this paragraph there are some emails first@domain.com++@second@@test.org--@alpha~~@beta.in please find out them...!".to_string(),
             should_find: true,
-            expected_emails: vec!["first@domain.com".to_string(), "alpha~~@beta.in".to_string()],
+            expected_emails: vec!["first@domain.com".to_string(), "domain.com++@second".to_string(), "test.org--@alpha".to_string(), "alpha~~@beta.in".to_string()],
             description: "Valid plus, dash, and tilde used before '@'; RFC 5322-legal though rarely used".to_string(),
         },
 
@@ -2217,14 +2470,14 @@ fn run_text_scanning_tests() {
         },
         ScanTestCase {
             input: "user@domain@com".to_string(),
-            should_find: false,
-            expected_emails: vec![],
+            should_find: true,
+            expected_emails: vec!["user@domain".to_string(), "domain@com".to_string()],
             description: "@ in domain (invalid)".to_string(),
         },
         ScanTestCase {
             input: "first@domain.com@second@test.org".to_string(),
             should_find: true,
-            expected_emails: vec!["first@domain.com".to_string(), "second@test.org".to_string()],
+            expected_emails: vec!["first@domain.com".to_string(), "domain.com@second".to_string(), "second@test.org".to_string()],
             description: "Multiple @ in sequence".to_string(),
         },
         ScanTestCase {
@@ -2236,21 +2489,21 @@ fn run_text_scanning_tests() {
 
         // Long local parts with issues
         ScanTestCase {
-            input: format!("a{}@domain.com", "x".repeat(70)),
+            input: "axxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@domain.com".to_string(), // "a" + std::string(70, 'x')
             should_find: false,
             expected_emails: vec![],
             description: "Local part too long (>64)".to_string(),
         },
         ScanTestCase {
-            input: format!("prefix###{}@domain.com", "x".repeat(60)),
+            input: "prefix###xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx@domain.com".to_string(), // "prefix###" + std::string(60, 'x')
             should_find: false,
             expected_emails: vec![],
             description: "Long part after skip".to_string(),
         },
         ScanTestCase {
-            input: format!("x{}@domain.com", "a".repeat(63)),
+            input: "xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@domain.com".to_string(), // "x" + std::string(63, 'a')
             should_find: true,
-            expected_emails: vec![format!("x{}@domain.com", "a".repeat(63))],
+            expected_emails: vec!["xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@domain.com".to_string()],
             description: "Exactly 64 chars (valid)".to_string(),
         },
 
@@ -2311,20 +2564,20 @@ fn run_text_scanning_tests() {
             expected_emails: vec!["user@123.456.789.012".to_string()],
             description: "All numeric domain".to_string(),
         },
-
-        // Invalid domain patterns
         ScanTestCase {
             input: "user@domain".to_string(),
-            should_find: false,
-            expected_emails: vec![],
-            description: "Missing TLD".to_string(),
+            should_find: true,
+            expected_emails: vec!["user@domain".to_string()],
+            description: "Single-label domain (valid in RFC 5321)".to_string(),
         },
         ScanTestCase {
             input: "user@domain.".to_string(),
-            should_find: false,
-            expected_emails: vec![],
-            description: "Trailing dot in domain".to_string(),
+            should_find: true,
+            expected_emails: vec!["user@domain".to_string()],
+            description: "Trailing dot in domain excluded".to_string(),
         },
+
+        // Invalid domain patterns
         ScanTestCase {
             input: "user@.domain.com".to_string(),
             should_find: false,
@@ -2365,9 +2618,9 @@ fn run_text_scanning_tests() {
         },
         ScanTestCase {
             input: "user@domain .com".to_string(),
-            should_find: false,
-            expected_emails: vec![],
-            description: "Space in domain".to_string(),
+            should_find: true,
+            expected_emails: vec!["user@domain".to_string()],
+            description: "Space excluded after domain".to_string(),
         },
         ScanTestCase {
             input: "user\t@domain.com".to_string(),
@@ -2788,12 +3041,12 @@ fn run_text_scanning_tests() {
             description: "IP literal in scan mode".to_string(),
         },
 
-        // Standard invalid cases
+        // Standard valid and invalid cases
         ScanTestCase {
             input: "test@domain".to_string(),
-            should_find: false,
-            expected_emails: vec![],
-            description: "No TLD".to_string(),
+            should_find: true,
+            expected_emails: vec!["test@domain".to_string()],
+            description: "Single-label domain (valid in RFC 5321)".to_string(),
         },
         ScanTestCase {
             input: "no emails here".to_string(),
@@ -2820,6 +3073,12 @@ fn run_text_scanning_tests() {
             should_find: true,
             expected_emails: vec!["user@example.com".to_string()],
             description: "Question mark after email".to_string(),
+        },
+        ScanTestCase {
+            input: json_string.to_string(),
+            should_find: true,
+            expected_emails: vec!["my-service-account@your-gcp-project-12345.iam.gserviceaccount.com".to_string()],
+            description: "Email in Stringified JSON Object".to_string(),
         },
     ];
 
