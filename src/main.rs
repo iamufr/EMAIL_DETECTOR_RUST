@@ -61,6 +61,7 @@ impl CharacterClassifier {
         0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
     ];
 
+    #[allow(dead_code)]
     #[inline(always)]
     fn is_alpha(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize] & Self::CHAR_ALPHA) != 0
@@ -666,7 +667,6 @@ struct HeuristicEmailScanner;
 impl HeuristicEmailScanner {
     const MAX_INPUT_SIZE: usize = 10 * 1024 * 1024;
     const MAX_LEFT_SCAN: usize = 4096;
-    const MAX_BACKTRACK_PER_AT: usize = 200;
     const MAX_BACKWARD_SCAN_CHARS: usize = 200;
     const MAX_QUOTE_SCAN: usize = 100;
 
@@ -932,7 +932,6 @@ impl HeuristicEmailScanner {
                         }
                     } else if start == effective_min + 1 {
                         start -= 1;
-                        chars_scanned += 1;
                         break;
                     }
                     start -= 1;
@@ -1077,7 +1076,7 @@ impl EmailScanner for HeuristicEmailScanner {
         let bytes = text.as_bytes();
         let mut pos = 0;
         let min_scanned_index = 0;
-        let mut last_consumed_end = 0;
+        let last_consumed_end = 0;
 
         while pos < len {
             let at_pos = match bytes[pos..].iter().position(|&b| b == b'@') {
