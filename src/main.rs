@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::thread;
@@ -17,7 +18,7 @@ trait EmailScanner: Send + Sync {
 }
 
 // ============================================================================
-// CHARACTER CLASSIFICATION (Lookup Tables) (Single Responsibility Principle)
+// CHARACTER CLASSIFICATION (Lookup Tables)
 // ============================================================================
 
 struct CharacterClassifier;
@@ -59,6 +60,11 @@ impl CharacterClassifier {
         0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
         0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
     ];
+
+    #[inline(always)]
+    fn is_alpha(c: u8) -> bool {
+        (Self::CHAR_TABLE[c as usize] & Self::CHAR_ALPHA) != 0
+    }
 
     #[inline(always)]
     fn is_digit(c: u8) -> bool {
@@ -114,7 +120,7 @@ impl CharacterClassifier {
 }
 
 // ============================================================================
-// LOCAL PART VALIDATOR (Single Responsibility Principle)
+// LOCAL PART VALIDATOR
 // ============================================================================
 
 #[derive(Copy, Clone)]
@@ -130,7 +136,7 @@ impl LocalPartValidator {
 
     #[inline(always)]
     fn validate_dot_atom(text: &[u8], start: usize, end: usize) -> bool {
-        if start >= end || end - start > Self::MAX_LOCAL_PART {
+        if start >= end || end > text.len() || (end - start) > Self::MAX_LOCAL_PART {
             return false;
         }
 
@@ -157,7 +163,9 @@ impl LocalPartValidator {
     }
 
     fn validate_quoted_string(text: &[u8], start: usize, end: usize) -> bool {
-        if start >= end || end - start > Self::MAX_LOCAL_PART + 2 {
+        let len = text.len();
+
+        if start >= end || end > len || (end - start) > (Self::MAX_LOCAL_PART + 2) {
             return false;
         }
 
@@ -165,12 +173,16 @@ impl LocalPartValidator {
             return false;
         }
 
-        if end - start < 3 {
+        if (end - start) < 3 {
             return false;
         }
 
         let mut escaped = false;
         for i in (start + 1)..(end - 1) {
+            if i >= len {
+                return false;
+            }
+
             let c = text[i];
             if escaped {
                 if c > 127 {
@@ -190,7 +202,9 @@ impl LocalPartValidator {
 
     #[inline(always)]
     fn validate_scan_mode(text: &[u8], start: usize, end: usize) -> bool {
-        if start >= end || end - start > Self::MAX_LOCAL_PART {
+        let len = text.len();
+
+        if start >= end || end > len || (end - start) > Self::MAX_LOCAL_PART {
             return false;
         }
 
@@ -200,6 +214,10 @@ impl LocalPartValidator {
 
         let mut prev_dot = false;
         for i in start..end {
+            if i >= len {
+                return false;
+            }
+
             let c = text[i];
             if c == b'.' {
                 if prev_dot {
@@ -218,6 +236,10 @@ impl LocalPartValidator {
 
     #[inline(always)]
     fn validate(text: &[u8], start: usize, end: usize, mode: ValidationMode) -> bool {
+        if start >= end || end > text.len() {
+            return false;
+        }
+
         if matches!(mode, ValidationMode::Scan) {
             return Self::validate_scan_mode(text, start, end);
         }
@@ -230,7 +252,7 @@ impl LocalPartValidator {
 }
 
 // ============================================================================
-// DOMAIN PART VALIDATOR (Single Responsibility Principle)
+// DOMAIN PART VALIDATOR
 // ============================================================================
 
 struct DomainPartValidator;
@@ -240,7 +262,9 @@ impl DomainPartValidator {
     const MAX_LABEL_LENGTH: usize = 63;
 
     fn validate_domain_labels(text: &[u8], start: usize, end: usize) -> bool {
-        if start >= end || end - start < 3 || end - start > Self::MAX_DOMAIN_PART {
+        let len = text.len();
+
+        if start >= end || end > len || (end - start) < 1 || (end - start) > Self::MAX_DOMAIN_PART {
             return false;
         }
 
@@ -252,8 +276,13 @@ impl DomainPartValidator {
             return false;
         }
 
+        // Check for consecutive dots
         let mut prev_dot = false;
         for i in start..end {
+            if i >= len {
+                return false;
+            }
+
             if text[i] == b'.' {
                 if prev_dot {
                     return false;
@@ -264,19 +293,18 @@ impl DomainPartValidator {
             }
         }
 
+        // Find last dot position
         let mut last_dot_pos = None;
-        for i in (start..end).rev() {
-            if text[i] == b'.' {
-                last_dot_pos = Some(i);
-                break;
+        if end > start {
+            for i in (start..end).rev() {
+                if text[i] == b'.' {
+                    last_dot_pos = Some(i);
+                    break;
+                }
             }
         }
 
-        let last_dot_pos = match last_dot_pos {
-            Some(pos) if pos > start && pos < end - 1 => pos,
-            _ => return false,
-        };
-
+        // Validate each label
         let mut label_start = start;
         let mut label_count = 0;
 
@@ -284,6 +312,10 @@ impl DomainPartValidator {
             if i == end || text[i] == b'.' {
                 let label_len = i - label_start;
                 if label_len == 0 || label_len > Self::MAX_LABEL_LENGTH {
+                    return false;
+                }
+
+                if label_start >= len || (label_start + label_len) > len {
                     return false;
                 }
 
@@ -303,89 +335,96 @@ impl DomainPartValidator {
             }
         }
 
-        if label_count < 2 {
+        if label_count < 1 {
             return false;
         }
 
-        let tld_start = last_dot_pos + 1;
-        let tld_len = end - tld_start;
+        // If we have 2+ labels, validate TLD is alphanumeric only
+        if label_count >= 2 {
+            if let Some(last_dot_pos) = last_dot_pos {
+                let tld_start = last_dot_pos + 1;
+                if tld_start >= end {
+                    return false;
+                }
 
-        if tld_len < 1 {
-            return false;
-        }
-
-        for i in tld_start..end {
-            if !CharacterClassifier::is_alpha_num(text[i]) {
-                return false;
+                for i in tld_start..end {
+                    if !CharacterClassifier::is_alpha_num(text[i]) {
+                        return false;
+                    }
+                }
             }
         }
 
         true
     }
 
-    fn validate_ip_literal(text: &[u8], start: usize, end: usize) -> bool {
-        if start >= end || text[start] != b'[' || text[end - 1] != b']' {
-            return false;
-        }
-
-        let ip_start = start + 1;
-        let ip_end = end - 1;
-
-        if ip_start >= ip_end {
-            return false;
-        }
-
-        if end - start > 6
-            && ip_start + 5 <= text.len()
-            && &text[ip_start..ip_start + 5] == b"IPv6:"
-        {
-            return Self::validate_ipv6(text, ip_start + 5, ip_end);
-        }
-
-        if Self::validate_ipv4(text, ip_start, ip_end) {
-            return true;
-        }
-
-        for i in ip_start..ip_end {
-            if text[i] == b':' {
-                return Self::validate_ipv6(text, ip_start, ip_end);
-            }
-        }
-
-        false
-    }
-
     fn validate_ipv4(text: &[u8], start: usize, end: usize) -> bool {
+        if start >= end || end > text.len() {
+            return false;
+        }
+
         let mut octets = Vec::new();
         let mut num_start = start;
 
         for i in start..=end {
             if i == end || text[i] == b'.' {
-                if i == num_start {
+                if i == num_start || num_start >= end {
                     return false;
                 }
 
                 let mut octet = 0u32;
+                let mut digit_count = 0;
+
                 for j in num_start..i {
+                    if j >= text.len() {
+                        return false;
+                    }
+
                     if !CharacterClassifier::is_digit(text[j]) {
                         return false;
                     }
 
-                    match octet
-                        .checked_mul(10)
-                        .and_then(|v| v.checked_add((text[j] - b'0') as u32))
-                    {
-                        Some(new_octet) if new_octet <= 255 => octet = new_octet,
-                        _ => return false,
+                    // Check for leading zeros
+                    if digit_count == 0 && text[j] == b'0' && (i - num_start) > 1 {
+                        return false;
                     }
+
+                    let digit = (text[j] - b'0') as u32;
+
+                    if octet > (255 - digit) / 10 {
+                        return false;
+                    }
+
+                    octet = octet * 10 + digit;
+                    digit_count += 1;
+                }
+
+                if octet > 255 {
+                    return false;
                 }
 
                 octets.push(octet);
+
+                if i >= text.len() {
+                    break;
+                }
+
                 num_start = i + 1;
+                if num_start > text.len() {
+                    return false;
+                }
             }
         }
 
-        octets.len() == 4
+        if octets.len() != 4 {
+            return false;
+        }
+
+        if num_start == 0 || num_start - 1 != end {
+            return false;
+        }
+
+        true
     }
 
     fn validate_ipv6(text: &[u8], start: usize, end: usize) -> bool {
@@ -394,21 +433,25 @@ impl DomainPartValidator {
         }
 
         let mut segment_count = 0;
-        let mut compression_pos: Option<i32> = None;
+        let mut has_compression = false;
         let mut pos = start;
+        let mut iterations = 0;
+        const MAX_IPV6_ITERATIONS: usize = 1000;
 
-        if pos + 1 < end && text[pos] == b':' && text[pos + 1] == b':' {
-            compression_pos = Some(0);
+        // Handle initial ::
+        if (pos + 1) < end && text[pos] == b':' && text[pos + 1] == b':' {
+            has_compression = true;
             pos += 2;
-
             if pos >= end {
-                return true;
+                return true; // Just "::" is valid (all zeros)
             }
-        } else if text[pos] == b':' {
-            return false;
+        } else if pos < end && text[pos] == b':' {
+            return false; // Can't start with single :
         }
 
-        while pos < end {
+        while pos < end && iterations < MAX_IPV6_ITERATIONS {
+            iterations += 1;
+
             let seg_start = pos;
             let mut hex_digits = 0;
 
@@ -422,7 +465,11 @@ impl DomainPartValidator {
 
             if hex_digits > 0 {
                 segment_count += 1;
+                if segment_count > 8 {
+                    return false;
+                }
 
+                // Check for embedded IPv4
                 if pos < end && text[pos] == b'.' {
                     if Self::validate_ipv4(text, seg_start, end) {
                         segment_count -= 1;
@@ -438,36 +485,108 @@ impl DomainPartValidator {
                 break;
             }
 
+            if pos >= text.len() {
+                return false;
+            }
+
             if text[pos] == b':' {
                 pos += 1;
 
                 if pos < end && text[pos] == b':' {
-                    if compression_pos.is_some() {
-                        return false;
+                    if has_compression {
+                        return false; // Multiple :: not allowed
                     }
 
-                    compression_pos = Some(segment_count);
+                    has_compression = true;
                     pos += 1;
 
                     if pos >= end {
                         break;
                     }
                 } else if hex_digits == 0 {
-                    return false;
+                    return false; // :: already handled
+                } else if pos >= end {
+                    return false; // Can't end with single :
                 }
             } else {
                 return false;
             }
         }
 
-        if compression_pos.is_some() {
+        if iterations >= MAX_IPV6_ITERATIONS {
+            return false;
+        }
+
+        if has_compression {
             segment_count <= 7
         } else {
             segment_count == 8
         }
     }
 
+    fn validate_ip_literal(text: &[u8], start: usize, end: usize) -> bool {
+        let len = text.len();
+
+        if start >= end || end > len {
+            return false;
+        }
+
+        if text[start] != b'[' || text[end - 1] != b']' {
+            return false;
+        }
+
+        let ip_start = start + 1;
+        let ip_end = if end > 0 { end - 1 } else { return false };
+
+        if ip_start >= ip_end || ip_end > len {
+            return false;
+        }
+
+        // Check for IPv6: prefix
+        if (end - start) > 6 && (ip_start + 5) <= len {
+            let prefix = &text[ip_start..ip_start + 5];
+            // Case-insensitive check for "IPv6:"
+            if prefix[0] | 0x20 == b'i'
+                && prefix[1] | 0x20 == b'p'
+                && prefix[2] | 0x20 == b'v'
+                && prefix[3] == b'6'
+                && prefix[4] == b':'
+            {
+                let mut addr_start = ip_start + 5;
+
+                // Handle "IPv6::" case
+                if addr_start < ip_end && text[addr_start] == b':' {
+                    if (addr_start + 1) < ip_end && text[addr_start + 1] == b':' {
+                        // Keep addr_start at IPv6: position
+                    } else {
+                        addr_start = ip_start + 4;
+                    }
+                }
+
+                return Self::validate_ipv6(text, addr_start, ip_end);
+            }
+        }
+
+        // Try IPv4
+        if Self::validate_ipv4(text, ip_start, ip_end) {
+            return true;
+        }
+
+        // Check if it contains : (might be IPv6 without prefix - invalid)
+        for i in ip_start..ip_end {
+            if text[i] == b':' {
+                return false;
+            }
+        }
+
+        false
+    }
+
     fn validate(text: &[u8], start: usize, end: usize) -> bool {
+        if start >= end || end > text.len() {
+            return false;
+        }
+
         if text[start] == b'[' {
             return Self::validate_ip_literal(text, start, end);
         }
@@ -476,7 +595,7 @@ impl DomainPartValidator {
 }
 
 // ============================================================================
-// EMAIL VALIDATOR (Open/Closed Principle - extensible through composition)
+// EMAIL VALIDATOR
 // ============================================================================
 
 struct RFC5322EmailValidator;
@@ -547,9 +666,13 @@ struct HeuristicEmailScanner;
 impl HeuristicEmailScanner {
     const MAX_INPUT_SIZE: usize = 10 * 1024 * 1024;
     const MAX_LEFT_SCAN: usize = 4096;
+    const MAX_BACKTRACK_PER_AT: usize = 200;
+    const MAX_BACKWARD_SCAN_CHARS: usize = 200;
+    const MAX_QUOTE_SCAN: usize = 100;
 
     #[inline(always)]
     fn find_first_alnum(data: &[u8], pos: usize, limit: usize) -> Option<usize> {
+        let limit = limit.min(data.len());
         for i in pos..limit {
             if CharacterClassifier::is_alpha_num(data[i]) {
                 return Some(i);
@@ -560,6 +683,7 @@ impl HeuristicEmailScanner {
 
     #[inline(always)]
     fn find_first_atext(data: &[u8], pos: usize, limit: usize) -> Option<usize> {
+        let limit = limit.min(data.len());
         for i in pos..limit {
             if CharacterClassifier::is_atext(data[i]) {
                 return Some(i);
@@ -575,7 +699,18 @@ impl HeuristicEmailScanner {
     ) -> EmailBoundaries {
         let len = text.len();
 
+        if at_pos >= len {
+            return EmailBoundaries {
+                start: at_pos,
+                end: at_pos,
+                valid_boundaries: false,
+                skip_to: at_pos,
+            };
+        }
+
         let mut end = at_pos + 1;
+
+        // Reject IP literals in scan mode
         if end < len && text[end] == b'[' {
             return EmailBoundaries {
                 start: at_pos,
@@ -585,72 +720,174 @@ impl HeuristicEmailScanner {
             };
         }
 
+        // Scan forward for domain
+        const MAX_DOMAIN_SCAN: usize = 253;
+        let mut domain_chars = 0;
+
         while end < len && CharacterClassifier::is_domain_char(text[end]) {
             end += 1;
+            domain_chars += 1;
+            if domain_chars > MAX_DOMAIN_SCAN {
+                return EmailBoundaries {
+                    start: at_pos,
+                    end: at_pos,
+                    valid_boundaries: false,
+                    skip_to: at_pos + 1,
+                };
+            }
         }
 
+        // Remove trailing dots
         while end > at_pos + 1 && text[end - 1] == b'.' {
             end -= 1;
         }
 
+        // If followed by @, remove trailing hyphens
         if end < len && text[end] == b'@' {
             while end > at_pos + 1 && text[end - 1] == b'-' {
                 end -= 1;
             }
         }
 
+        // Handle quoted strings before @
+        if at_pos > 0
+            && (text[at_pos - 1] == b'"' || text[at_pos - 1] == b'\'' || text[at_pos - 1] == b'`')
+        {
+            let closing_quote = text[at_pos - 1];
+            let mut quotes_seen = 0;
+
+            let absolute_min = at_pos.saturating_sub(Self::MAX_LEFT_SCAN);
+
+            if at_pos >= 2 {
+                for i in (absolute_min + 1..at_pos).rev() {
+                    if i < 1 {
+                        break;
+                    }
+                    quotes_seen += 1;
+
+                    if quotes_seen > Self::MAX_QUOTE_SCAN {
+                        break;
+                    }
+
+                    if text[i] == closing_quote {
+                        let valid_boundary = if i == 0 || i == absolute_min {
+                            true
+                        } else if i > 0 {
+                            let prev_char = text[i - 1];
+                            CharacterClassifier::is_scan_boundary(prev_char)
+                                || prev_char == b' '
+                                || prev_char == b'='
+                                || prev_char == b':'
+                                || prev_char == b','
+                                || prev_char == b'<'
+                                || prev_char == b'('
+                                || prev_char == b'['
+                                || prev_char == b'\r'
+                                || prev_char == b'\n'
+                                || CharacterClassifier::is_invalid_local_char(prev_char)
+                        } else {
+                            false
+                        };
+
+                        if valid_boundary && (at_pos - i) >= 3 {
+                            let right_boundary_valid = if end < len {
+                                let next_char = text[end];
+                                CharacterClassifier::is_scan_right_boundary(next_char)
+                                    || next_char == b'\''
+                                    || next_char == b'`'
+                                    || next_char == b'"'
+                                    || next_char == b'@'
+                                    || next_char == b'\\'
+                                    || next_char == b','
+                                    || next_char == b';'
+                                    || next_char == b'.'
+                                    || next_char == b'!'
+                                    || next_char == b'?'
+                                    || CharacterClassifier::is_atext(next_char)
+                            } else {
+                                true
+                            };
+
+                            if right_boundary_valid {
+                                return EmailBoundaries {
+                                    start: i,
+                                    end,
+                                    valid_boundaries: true,
+                                    skip_to: 0,
+                                };
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Scan backward for local part
         let mut start = at_pos;
         let mut hit_invalid_char = false;
         let mut invalid_char_pos = at_pos;
         let mut did_recovery = false;
+        let mut chars_scanned = 0;
 
-        let effective_min = if at_pos > Self::MAX_LEFT_SCAN {
-            min_scanned_index.max(at_pos - Self::MAX_LEFT_SCAN)
-        } else {
-            min_scanned_index
-        };
+        let absolute_min = at_pos.saturating_sub(Self::MAX_LEFT_SCAN);
+        let effective_min = min_scanned_index.max(absolute_min);
 
-        while start > effective_min {
+        while start > effective_min && chars_scanned < Self::MAX_BACKWARD_SCAN_CHARS {
+            if start == 0 {
+                break;
+            }
+
             let prev_char = text[start - 1];
 
             if prev_char == b'@' {
                 break;
             }
 
-            if prev_char == b'.' && start > effective_min + 1 && text[start - 2] == b'.' {
-                hit_invalid_char = true;
-                invalid_char_pos = start - 1;
-                break;
+            if prev_char == b'.' && start > effective_min + 1 && start > 1 {
+                if text[start - 2] == b'.' {
+                    hit_invalid_char = true;
+                    invalid_char_pos = start - 1;
+                    break;
+                }
             }
 
             if CharacterClassifier::is_invalid_local_char(prev_char) {
-                if prev_char == b'@' && start > effective_min + 1 {
+                // Recovery logic for @ followed by valid chars
+                if prev_char == b'@' && start > effective_min + 1 && start > 1 {
                     let mut lookback = start - 2;
-                    let mut valid_start = start - 1;
                     let mut found_valid = false;
-
                     let lookback_limit = effective_min;
+                    let mut lookback_iterations = 0;
+                    const MAX_LOOKBACK_ITERATIONS: usize = 100;
 
                     loop {
-                        if lookback < lookback_limit || lookback >= at_pos {
+                        if lookback < lookback_limit
+                            || lookback >= at_pos
+                            || lookback >= len
+                            || lookback_iterations >= MAX_LOOKBACK_ITERATIONS
+                        {
                             break;
                         }
 
                         let c = text[lookback];
                         if CharacterClassifier::is_atext(c) && c != b'.' {
                             found_valid = true;
-                            valid_start = lookback;
-                            if lookback == lookback_limit {
+                            start = lookback;
+                            if lookback == lookback_limit || lookback == 0 {
+                                break;
+                            }
+                            if lookback == 0 {
                                 break;
                             }
                             lookback -= 1;
+                            lookback_iterations += 1;
                             continue;
                         }
                         break;
                     }
 
                     if found_valid {
-                        start = valid_start;
+                        chars_scanned += 1;
                         continue;
                     }
                 }
@@ -661,24 +898,28 @@ impl HeuristicEmailScanner {
             }
 
             if CharacterClassifier::is_quote_char(prev_char) {
-                let has_matching_quote =
-                    if start > effective_min + 1 && text[start - 2] == prev_char {
+                // Check for matching quote pairs
+                if start > effective_min + 1 && start > 1 && text[start - 2] == prev_char {
+                    start -= 1;
+                    chars_scanned += 1;
+                    continue;
+                }
+
+                let has_matching_quote = if end < len && text[end] == prev_char {
+                    if end + 1 < len && text[end + 1] == prev_char {
                         start -= 1;
+                        chars_scanned += 1;
                         continue;
-                    } else if end < len && text[end] == prev_char {
-                        if end + 1 < len && text[end + 1] == prev_char {
-                            start -= 1;
-                            continue;
-                        }
-                        true
-                    } else {
-                        false
-                    };
+                    }
+                    true
+                } else {
+                    false
+                };
 
                 if has_matching_quote {
                     break;
                 } else {
-                    if start > effective_min + 1 {
+                    if start > effective_min + 1 && start > 1 {
                         let prev_prev_char = text[start - 2];
                         if prev_prev_char == b'='
                             || prev_prev_char == b':'
@@ -686,13 +927,16 @@ impl HeuristicEmailScanner {
                             || CharacterClassifier::is_quote_char(prev_prev_char)
                         {
                             start -= 1;
+                            chars_scanned += 1;
                             continue;
                         }
                     } else if start == effective_min + 1 {
                         start -= 1;
+                        chars_scanned += 1;
                         break;
                     }
                     start -= 1;
+                    chars_scanned += 1;
                     continue;
                 }
             }
@@ -704,8 +948,11 @@ impl HeuristicEmailScanner {
             } else {
                 break;
             }
+
+            chars_scanned += 1;
         }
 
+        // Handle invalid character recovery
         if hit_invalid_char {
             if let Some(recovery_pos) =
                 Self::find_first_alnum(text, invalid_char_pos.max(effective_min), at_pos)
@@ -728,11 +975,13 @@ impl HeuristicEmailScanner {
             }
         }
 
+        // Remove leading dots
         while start < at_pos && text[start] == b'.' {
             start += 1;
         }
 
-        if start < at_pos && start > effective_min {
+        // Check character before start
+        if start < at_pos && start > effective_min && start > 0 {
             let char_before_start = text[start - 1];
             if CharacterClassifier::is_invalid_local_char(char_before_start) {
                 if let Some(first_alnum) = Self::find_first_alnum(text, start, at_pos) {
@@ -751,9 +1000,10 @@ impl HeuristicEmailScanner {
             };
         }
 
+        // Validate boundaries
         let mut valid_boundaries = true;
 
-        if start > effective_min {
+        if start > effective_min && start > 0 {
             let prev_char = text[start - 1];
 
             if did_recovery {
@@ -772,7 +1022,10 @@ impl HeuristicEmailScanner {
                 valid_boundaries = false;
             }
 
-            if CharacterClassifier::is_quote_char(prev_char) && start > effective_min + 1 {
+            if CharacterClassifier::is_quote_char(prev_char)
+                && start > effective_min + 1
+                && start >= 2
+            {
                 let prev_prev_char = text[start - 2];
                 if CharacterClassifier::is_scan_boundary(prev_prev_char)
                     || prev_prev_char == b'='
@@ -783,8 +1036,10 @@ impl HeuristicEmailScanner {
                 }
             }
 
-            if prev_char == b'/' && start > effective_min + 1 && text[start - 2] == b'/' {
-                valid_boundaries = true;
+            if prev_char == b'/' && start > effective_min + 1 && start >= 2 {
+                if text[start - 2] == b'/' {
+                    valid_boundaries = true;
+                }
             }
         }
 
@@ -822,7 +1077,7 @@ impl EmailScanner for HeuristicEmailScanner {
         let bytes = text.as_bytes();
         let mut pos = 0;
         let min_scanned_index = 0;
-        let last_consumed_end = 0;
+        let mut last_consumed_end = 0;
 
         while pos < len {
             let at_pos = match bytes[pos..].iter().position(|&b| b == b'@') {
@@ -851,7 +1106,16 @@ impl EmailScanner for HeuristicEmailScanner {
                 continue;
             }
 
-            if LocalPartValidator::validate(bytes, boundaries.start, at_pos, ValidationMode::Scan)
+            let mode = if boundaries.start < at_pos
+                && boundaries.start < len
+                && text.as_bytes()[boundaries.start] == b'"'
+            {
+                ValidationMode::Exact
+            } else {
+                ValidationMode::Scan
+            };
+
+            if LocalPartValidator::validate(bytes, boundaries.start, at_pos, mode)
                 && DomainPartValidator::validate(bytes, at_pos + 1, boundaries.end)
             {
                 return true;
@@ -871,9 +1135,7 @@ impl EmailScanner for HeuristicEmailScanner {
         }
 
         let mut emails = Vec::new();
-        let expected_unique = (len / 30).min(20000);
-        let reserve_size = (expected_unique * 13) / 10 + 1;
-        let mut seen = std::collections::HashSet::with_capacity(reserve_size);
+        let mut seen = HashSet::new();
 
         let bytes = text.as_bytes();
         let mut pos = 0;
@@ -907,17 +1169,57 @@ impl EmailScanner for HeuristicEmailScanner {
                 continue;
             }
 
-            if LocalPartValidator::validate(bytes, boundaries.start, at_pos, ValidationMode::Scan)
+            let mode = if boundaries.start < at_pos
+                && boundaries.start < len
+                && text.as_bytes()[boundaries.start] == b'"'
+            {
+                ValidationMode::Exact
+            } else {
+                ValidationMode::Scan
+            };
+
+            if LocalPartValidator::validate(bytes, boundaries.start, at_pos, mode)
                 && DomainPartValidator::validate(bytes, at_pos + 1, boundaries.end)
             {
+                if boundaries.start >= text.len()
+                    || boundaries.end > text.len()
+                    || boundaries.start >= boundaries.end
+                {
+                    pos = at_pos + 1;
+                    continue;
+                }
+
                 let email = &text[boundaries.start..boundaries.end];
 
-                if seen.insert(email) {
+                if seen.insert(email.to_string()) {
                     emails.push(email.to_string());
                 }
 
                 min_scanned_index = min_scanned_index.max(boundaries.start);
                 last_consumed_end = last_consumed_end.max(boundaries.end);
+
+                // Check for nearby @ symbols
+                if boundaries.end < len {
+                    let next_char = bytes[boundaries.end];
+
+                    if CharacterClassifier::is_atext(next_char) || next_char == b'.' {
+                        let mut found_nearby_at = false;
+                        let look_limit = (boundaries.end + 65).min(len);
+
+                        for look in boundaries.end..look_limit {
+                            if bytes[look] == b'@' {
+                                found_nearby_at = true;
+                                break;
+                            }
+                        }
+
+                        if found_nearby_at {
+                            pos = boundaries.end;
+                            continue;
+                        }
+                    }
+                }
+
                 pos = boundaries.end;
                 continue;
             }
@@ -930,7 +1232,7 @@ impl EmailScanner for HeuristicEmailScanner {
 }
 
 // ============================================================================
-// FACTORY (Dependency Inversion Principle)
+// FACTORY
 // ============================================================================
 
 struct EmailValidatorFactory;
