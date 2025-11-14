@@ -277,7 +277,6 @@ impl DomainPartValidator {
             return false;
         }
 
-        // Check for consecutive dots
         let mut prev_dot = false;
         for i in start..end {
             if i >= len {
@@ -294,7 +293,6 @@ impl DomainPartValidator {
             }
         }
 
-        // Find last dot position
         let mut last_dot_pos = None;
         if end > start {
             for i in (start..end).rev() {
@@ -305,7 +303,6 @@ impl DomainPartValidator {
             }
         }
 
-        // Validate each label
         let mut label_start = start;
         let mut label_count = 0;
 
@@ -340,7 +337,6 @@ impl DomainPartValidator {
             return false;
         }
 
-        // If we have 2+ labels, validate TLD is alphanumeric only
         if label_count >= 2 {
             if let Some(last_dot_pos) = last_dot_pos {
                 let tld_start = last_dot_pos + 1;
@@ -385,7 +381,6 @@ impl DomainPartValidator {
                         return false;
                     }
 
-                    // Check for leading zeros
                     if digit_count == 0 && text[j] == b'0' && (i - num_start) > 1 {
                         return false;
                     }
@@ -439,15 +434,14 @@ impl DomainPartValidator {
         let mut iterations = 0;
         const MAX_IPV6_ITERATIONS: usize = 1000;
 
-        // Handle initial ::
         if (pos + 1) < end && text[pos] == b':' && text[pos + 1] == b':' {
             has_compression = true;
             pos += 2;
             if pos >= end {
-                return true; // Just "::" is valid (all zeros)
+                return true;
             }
         } else if pos < end && text[pos] == b':' {
-            return false; // Can't start with single :
+            return false;
         }
 
         while pos < end && iterations < MAX_IPV6_ITERATIONS {
@@ -470,7 +464,6 @@ impl DomainPartValidator {
                     return false;
                 }
 
-                // Check for embedded IPv4
                 if pos < end && text[pos] == b'.' {
                     if Self::validate_ipv4(text, seg_start, end) {
                         segment_count -= 1;
@@ -495,7 +488,7 @@ impl DomainPartValidator {
 
                 if pos < end && text[pos] == b':' {
                     if has_compression {
-                        return false; // Multiple :: not allowed
+                        return false;
                     }
 
                     has_compression = true;
@@ -505,9 +498,9 @@ impl DomainPartValidator {
                         break;
                     }
                 } else if hex_digits == 0 {
-                    return false; // :: already handled
+                    return false;
                 } else if pos >= end {
-                    return false; // Can't end with single :
+                    return false;
                 }
             } else {
                 return false;
@@ -543,10 +536,8 @@ impl DomainPartValidator {
             return false;
         }
 
-        // Check for IPv6: prefix
         if (end - start) > 6 && (ip_start + 5) <= len {
             let prefix = &text[ip_start..ip_start + 5];
-            // Case-insensitive check for "IPv6:"
             if prefix[0] | 0x20 == b'i'
                 && prefix[1] | 0x20 == b'p'
                 && prefix[2] | 0x20 == b'v'
@@ -555,7 +546,6 @@ impl DomainPartValidator {
             {
                 let mut addr_start = ip_start + 5;
 
-                // Handle "IPv6::" case
                 if addr_start < ip_end && text[addr_start] == b':' {
                     if (addr_start + 1) < ip_end && text[addr_start + 1] == b':' {
                         // Keep addr_start at IPv6: position
@@ -568,12 +558,10 @@ impl DomainPartValidator {
             }
         }
 
-        // Try IPv4
         if Self::validate_ipv4(text, ip_start, ip_end) {
             return true;
         }
 
-        // Check if it contains : (might be IPv6 without prefix - invalid)
         for i in ip_start..ip_end {
             if text[i] == b':' {
                 return false;
@@ -660,7 +648,7 @@ struct EmailBoundaries {
     end: usize,
     valid_boundaries: bool,
     skip_to: usize,
-    did_trim_domain: bool, // ADDED: Missing field from C++ version
+    did_trim_domain: bool,
 }
 
 struct HeuristicEmailScanner;
@@ -712,7 +700,6 @@ impl HeuristicEmailScanner {
 
         let mut end = at_pos + 1;
 
-        // Reject IP literals in scan mode
         if end < len && text[end] == b'[' {
             return EmailBoundaries {
                 start: at_pos,
@@ -723,7 +710,6 @@ impl HeuristicEmailScanner {
             };
         }
 
-        // ADDED: Domain trimming logic from C++
         const MAX_DOMAIN_PART: usize = 255;
         const MAX_LABEL_LENGTH: usize = 63;
         let mut domain_chars = 0;
@@ -731,14 +717,12 @@ impl HeuristicEmailScanner {
         let mut current_label_length = 0;
 
         while end < len && CharacterClassifier::is_domain_char(text[end]) {
-            // ADDED: Trim if domain exceeds max length
             if domain_chars >= MAX_DOMAIN_PART {
                 end = at_pos + 1 + MAX_DOMAIN_PART;
                 did_trim_domain = true;
                 break;
             }
 
-            // ADDED: Track label length and trim if needed
             if text[end] == b'.' {
                 current_label_length = 0;
             } else {
@@ -752,19 +736,16 @@ impl HeuristicEmailScanner {
             domain_chars += 1;
         }
 
-        // Remove trailing dots
         while end > at_pos + 1 && text[end - 1] == b'.' {
             end -= 1;
         }
 
-        // If followed by @, remove trailing hyphens
         if end < len && text[end] == b'@' {
             while end > at_pos + 1 && text[end - 1] == b'-' {
                 end -= 1;
             }
         }
 
-        // Handle quoted strings before @
         if at_pos > 0
             && (text[at_pos - 1] == b'"' || text[at_pos - 1] == b'\'' || text[at_pos - 1] == b'`')
         {
@@ -838,12 +819,11 @@ impl HeuristicEmailScanner {
             }
         }
 
-        // Scan backward for local part
         let mut start = at_pos;
         let mut hit_invalid_char = false;
         let mut invalid_char_pos = at_pos;
         let mut did_recovery = false;
-        let mut did_trim = false; // ADDED: Track if we trimmed the local part
+        let mut did_trim = false;
         let mut chars_scanned = 0;
 
         let absolute_min = at_pos.saturating_sub(Self::MAX_LEFT_SCAN);
@@ -869,7 +849,6 @@ impl HeuristicEmailScanner {
             }
 
             if CharacterClassifier::is_invalid_local_char(prev_char) {
-                // Recovery logic for @ followed by valid chars
                 if prev_char == b'@' && start > effective_min + 1 && start > 1 {
                     let mut lookback = start - 2;
                     let mut found_valid = false;
@@ -915,7 +894,6 @@ impl HeuristicEmailScanner {
             }
 
             if CharacterClassifier::is_quote_char(prev_char) {
-                // Check for matching quote pairs
                 if start > effective_min + 1 && start > 1 && text[start - 2] == prev_char {
                     start -= 1;
                     chars_scanned += 1;
@@ -968,7 +946,6 @@ impl HeuristicEmailScanner {
             chars_scanned += 1;
         }
 
-        // Handle invalid character recovery
         if hit_invalid_char {
             if let Some(recovery_pos) =
                 Self::find_first_alnum(text, invalid_char_pos.max(effective_min), at_pos)
@@ -992,12 +969,10 @@ impl HeuristicEmailScanner {
             }
         }
 
-        // Remove leading dots
         while start < at_pos && text[start] == b'.' {
             start += 1;
         }
 
-        // Check character before start
         if start < at_pos && start > effective_min && start > 0 {
             let char_before_start = text[start - 1];
             if CharacterClassifier::is_invalid_local_char(char_before_start) {
@@ -1018,18 +993,15 @@ impl HeuristicEmailScanner {
             };
         }
 
-        // ADDED: Trim local part if too long (from C++)
         const MAX_LOCAL_PART: usize = 64;
         if (at_pos - start) > MAX_LOCAL_PART {
             did_trim = true;
             start = at_pos - MAX_LOCAL_PART;
 
-            // Remove leading dots after trimming
             while start < at_pos && text[start] == b'.' {
                 start += 1;
             }
 
-            // Try to find a better boundary after trimming
             if start > effective_min && start > 0 {
                 let prev_char = text[start - 1];
 
@@ -1055,24 +1027,20 @@ impl HeuristicEmailScanner {
                 }
             }
 
-            // Final check to ensure we don't exceed MAX_LOCAL_PART
             if (at_pos - start) > MAX_LOCAL_PART {
                 start = at_pos - MAX_LOCAL_PART;
             }
 
-            // Remove leading dots again after adjustment
             while start < at_pos && text[start] == b'.' {
                 start += 1;
             }
         }
 
-        // Validate boundaries
         let mut valid_boundaries = true;
 
         if start > effective_min && start > 0 {
             let prev_char = text[start - 1];
 
-            // ADDED: Special handling when trimming occurred (from C++)
             if did_trim {
                 valid_boundaries = true;
             } else if did_recovery {
@@ -1113,7 +1081,6 @@ impl HeuristicEmailScanner {
             }
         }
 
-        // ADDED: Don't check right boundary if domain was trimmed (from C++)
         if end < len && valid_boundaries && !did_trim_domain {
             let next_char = text[end];
             if !CharacterClassifier::is_scan_right_boundary(next_char)
@@ -1133,7 +1100,7 @@ impl HeuristicEmailScanner {
             end,
             valid_boundaries,
             skip_to: 0,
-            did_trim_domain, // ADDED: Return the trim status
+            did_trim_domain,
         }
     }
 }
@@ -1188,7 +1155,6 @@ impl EmailScanner for HeuristicEmailScanner {
             };
 
             let local_valid = LocalPartValidator::validate(bytes, boundaries.start, at_pos, mode);
-            // ADDED: Accept trimmed domains as valid (from C++)
             let domain_valid = boundaries.did_trim_domain
                 || DomainPartValidator::validate(bytes, at_pos + 1, boundaries.end);
 
@@ -1254,7 +1220,6 @@ impl EmailScanner for HeuristicEmailScanner {
             };
 
             let local_valid = LocalPartValidator::validate(bytes, boundaries.start, at_pos, mode);
-            // ADDED: Accept trimmed domains as valid (from C++)
             let domain_valid = boundaries.did_trim_domain
                 || DomainPartValidator::validate(bytes, at_pos + 1, boundaries.end);
 
@@ -1276,7 +1241,6 @@ impl EmailScanner for HeuristicEmailScanner {
                 min_scanned_index = min_scanned_index.max(boundaries.start);
                 last_consumed_end = last_consumed_end.max(boundaries.end);
 
-                // Check for nearby @ symbols
                 if boundaries.end < len {
                     let next_char = bytes[boundaries.end];
 
@@ -2867,7 +2831,7 @@ fn run_text_scanning_tests() {
             description: "Two valid separate emails".to_string(),
         },
 
-        // Long local parts with issues
+        // Long local and domain parts
         ScanTestCase {
             input: format!("a{}@domain.com", "x".repeat(70)),
             should_find: true,
@@ -2899,9 +2863,9 @@ fn run_text_scanning_tests() {
             description: "Long part after skip (slice to last 64 in local-part and 255 in domain-part)".to_string(),
         },
         ScanTestCase {
-            input: format!("x{}@domain.com", "a".repeat(63)),
+            input: format!("{}hidden@email{}", "x".repeat(1000), "y".repeat(1000)),
             should_find: true,
-            expected_emails: vec![format!("x{}@domain.com", "a".repeat(63))],
+            expected_emails: vec![format!("{}hidden@email{}", "x".repeat(58), "y".repeat(250))],
             description: "Exactly 64 chars (valid)".to_string(),
         },
 
