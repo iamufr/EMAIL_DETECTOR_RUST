@@ -3511,145 +3511,329 @@ fn run_text_scanning_tests() {
 
 fn run_performance_benchmark() {
     println!("\n{}", "=".repeat(100));
-    println!("=== PERFORMANCE BENCHMARK ===");
-    println!("{}", "=".repeat(100));
-    let s_static: &'static str = Box::leak(
-        format!("{}hidden@email.com{}", "x".repeat(1000), "y".repeat(1000)).into_boxed_str(),
-    );
+    println!("=== COMPREHENSIVE PERFORMANCE BENCHMARK ===");
+    println!("{}\n", "=".repeat(100));
 
-    let test_cases: Vec<&'static str> = vec![
-        "Simple email: user@example.com in text",
-        "Multiple emails: first@domain.com and second@another.org",
-        "user..double@domain.com",
-        "Complex: john.doe+filter@sub.domain.co.uk mixed with text",
-        "No emails in this text at all",
-        "Edge case: a@b.co minimal email",
-        "review-team@geeksforgeeks.org",
-        "user..double@domain.com",
-        "user.@domain.com",
-        "27 age and alpha@gmail.com and other data",
-        "adfdgifldj@fk458439678 4krf8956 346 alpha@gmail.com r90wjk kf433@8958ifdjkks fgkl548765gr",
-        "27 age and alphatyicbnkdleoxkthes123fd56569565@gmail.com and othere data missing...!",
-        "any aged group and alphatyic(b)nkdleoxk%t/hes123fd56569565@gmail.com and othere data missing...!",
-        "27 age and alphatyicbnk.?'.,dleoxkthes123fd56569565@gmail.com and othere data missing...! other@email.co",
-        "27 age and alphatyicbnkdleo$#-=+xkthes123fd56569565@gmail.com and othere data missing...!",
-        "No email here",
-        "test@domain",
-        "invalid@.com",
-        "valid.email+tag@example.co.uk",
-        "Contact us at support@company.com for help",
-        "Multiple: first@test.com, second@demo.org",
-        "invalid@.com and test@domain",
-        s_static,
-        "user@example.com",
-        "a@b.co",
-        "test.user@example.com",
-        "user+tag@gmail.com",
-        "user!test@example.com",
-        "user#tag@example.com",
-        "user$admin@example.com",
-        "user%percent@example.com",
-        "user&name@example.com",
-        "user'quote@example.com",
-        "user*star@example.com",
-        "user=equal@example.com",
-        "user?question@example.com",
-        "user^caret@example.com",
-        "user_underscore@example.com",
-        "user`backtick@example.com",
-        "userbrace@example.com",
-        "user|pipe@example.com",
-        "user}brace@example.com",
-        "user~tilde@example.com",
-        "\"user\"@example.com",
-        "\"user name\"@example.com",
-        "\"user@internal\"@example.com",
-        "\"user.name\"@example.com",
-        "\"user\\\"name\"@example.com",
-        "\"user\\\\name\"@example.com",
-        "user@[192.168.1.1]",
-        "user@[2001:db8::1]",
-        "test@[10.0.0.1]",
-        "user@[fe80::1]",
-        "user@[::1]",
-        "first.last@sub.domain.co.uk",
-        "user@domain-name.com",
-        "user@123.456.789.012",
-        "user@domain.x",
-        "user@domain.123",
-        "user..double@domain.com",
-        ".user@domain.com",
-        "user.@domain.com",
-        "user@domain..com",
-        "@example.com",
-        "user@",
-        "userexample.com",
-        "user@@example.com",
-        "user@domain",
-        "user@.domain.com",
-        "user@domain.com.",
-        "user@-domain.com",
-        "user@domain-.com",
-        "user name@example.com",
-        "user@domain .com",
-        "\"unclosed@example.com",
-        "\"user\"name@example.com",
-        "user@[192.168.1]",
-        "user@[999.168.1.1]",
-        "user@[192.168.1.256]",
-        "user@[gggg::1]",
+    // Define the test cases
+    let test_cases: Vec<String> = vec![
+        "Simple email: user@example.com in text".to_string(),
+        "Multiple emails: first@domain.com and second@another.org".to_string(),
+        "user..double@domain.com".to_string(),
+        "Complex: john.doe+filter@sub.domain.co.uk mixed with text".to_string(),
+        "No emails in this text at all".to_string(),
+        "Edge case: a@b.co minimal email".to_string(),
+        "review-team@geeksforgeeks.org".to_string(),
+        "user..double@domain.com".to_string(),
+        "user.@domain.com".to_string(),
+        "27 age and alpha@gmail.com and other data".to_string(),
+        "adfdgifldj@fk458439678 4krf8956 346 alpha@gmail.com r90wjk kf433@8958ifdjkks fgkl548765gr".to_string(),
+        "27 age and alphatyicbnkdleoxkthes123fd56569565@gmail.com and othere data missing...!".to_string(),
+        "any aged group and alphatyic(b)nkdleoxk%t/hes123fd56569565@gmail.com and othere data missing...!".to_string(),
+        "27 age and alphatyicbnk.?'.,dleoxkthes123fd56569565@gmail.com and othere data missing...! other@email.co".to_string(),
+        "27 age and alphatyicbnkdleo$#-=+xkthes123fd56569565@gmail.com and othere data missing...!".to_string(),
+        "No email here".to_string(),
+        "test@domain".to_string(),
+        "invalid@.com".to_string(),
+        "valid.email+tag@example.co.uk".to_string(),
+        "Contact us at support@company.com for help".to_string(),
+        "Multiple: first@test.com, second@demo.org".to_string(),
+        "invalid@.com and test@domain".to_string(),
+        format!("{}hidden@email.com{}", "x".repeat(1000), "y".repeat(1000)),
+        "user@example.com".to_string(),
+        "a@b.co".to_string(),
+        "test.user@example.com".to_string(),
+        "user+tag@gmail.com".to_string(),
+        "user!test@example.com".to_string(),
+        "user#tag@example.com".to_string(),
+        "user$admin@example.com".to_string(),
+        "user%percent@example.com".to_string(),
+        "user&name@example.com".to_string(),
+        "user'quote@example.com".to_string(),
+        "user*star@example.com".to_string(),
+        "user=equal@example.com".to_string(),
+        "user?question@example.com".to_string(),
+        "user^caret@example.com".to_string(),
+        "user_underscore@example.com".to_string(),
+        "user`backtick@example.com".to_string(),
+        "user{brace@example.com".to_string(),
+        "user|pipe@example.com".to_string(),
+        "user}brace@example.com".to_string(),
+        "user~tilde@example.com".to_string(),
+        "\"user\"@example.com".to_string(),
+        "\"user name\"@example.com".to_string(),
+        "\"user@internal\"@example.com".to_string(),
+        "\"user.name\"@example.com".to_string(),
+        "\"user\\\"name\"@example.com".to_string(),
+        "\"user\\\\name\"@example.com".to_string(),
+        "user@[192.168.1.1]".to_string(),
+        "user@[2001:db8::1]".to_string(),
+        "test@[10.0.0.1]".to_string(),
+        "user@[fe80::1]".to_string(),
+        "user@[::1]".to_string(),
+        "first.last@sub.domain.co.uk".to_string(),
+        "user@domain-name.com".to_string(),
+        "user@123.456.789.012".to_string(),
+        "user@domain.x".to_string(),
+        "user@domain.123".to_string(),
+        "user..double@domain.com".to_string(),
+        ".user@domain.com".to_string(),
+        "user.@domain.com".to_string(),
+        "user@domain..com".to_string(),
+        "@example.com".to_string(),
+        "user@".to_string(),
+        "userexample.com".to_string(),
+        "user@@example.com".to_string(),
+        "user@domain".to_string(),
+        "user@.domain.com".to_string(),
+        "user@domain.com.".to_string(),
+        "user@-domain.com".to_string(),
+        "user@domain-.com".to_string(),
+        "user name@example.com".to_string(),
+        "user@domain .com".to_string(),
+        "\"unclosed@example.com".to_string(),
+        "\"user\"name@example.com".to_string(),
+        "user@[192.168.1]".to_string(),
+        "user@[999.168.1.1]".to_string(),
+        "user@[192.168.1.256]".to_string(),
+        "user@[gggg::1]".to_string(),
     ];
 
-    let num_threads = num_cpus::get();
-    let iterations_per_thread = 100000;
+    // Wrap test cases in Arc to share them safely across threads
+    let test_cases = Arc::new(test_cases);
 
-    println!("Threads: {}", num_threads);
-    println!("Iterations per thread: {}", iterations_per_thread);
-    println!("Test cases: {}", test_cases.len());
+    let num_threads = std::thread::available_parallelism().unwrap().get();
+    let iterations_per_thread = 100_000;
+    let num_test_cases = test_cases.len();
+    let total_ops_per_method =
+        (num_threads as i64) * (iterations_per_thread as i64) * (num_test_cases as i64);
+
+    println!("Configuration:");
+    println!("  Threads: {}", num_threads);
+    println!("  Iterations per thread: {}", iterations_per_thread);
+    println!("  Test cases: {}", num_test_cases);
     println!(
-        "Total operations: {}\n",
-        num_threads * iterations_per_thread * test_cases.len()
+        "  Total operations per method: {}",
+        total_ops_per_method
     );
-    println!("Starting benchmark...");
 
-    let start = Instant::now();
-    let total_validations = Arc::new(AtomicI64::new(0));
+    // ============================================================================
+    // BENCHMARK 1: isValid() - Exact Email Validation
+    // ============================================================================
+    println!("\n{}", "-".repeat(100));
+    println!("BENCHMARK 1: isValid() - Exact Email Validation");
+    println!("{}", "-".repeat(100));
+    {
+        let start = Instant::now();
+        let valid_count = Arc::new(AtomicI64::new(0));
+        let mut threads = Vec::new();
 
-    let handles: Vec<_> = (0..num_threads)
-        .map(|_| {
-            let test_cases = test_cases.clone();
-            let total_validations = Arc::clone(&total_validations);
-            let validator = EmailValidatorFactory::create_validator();
-            let scanner = EmailValidatorFactory::create_scanner();
+        for _ in 0..num_threads {
+            let test_cases_clone = Arc::clone(&test_cases);
+            let valid_count_clone = Arc::clone(&valid_count);
 
-            thread::spawn(move || {
-                let mut local_validations = 0i64;
+            threads.push(thread::spawn(move || {
+                let local_validator = EmailValidatorFactory::create_validator();
+                let mut local_valid = 0;
+
                 for _ in 0..iterations_per_thread {
-                    for test in &test_cases {
-                        if validator.is_valid(test) || scanner.contains(test) {
-                            local_validations += 1;
+                    for test in test_cases_clone.iter() {
+                        if local_validator.is_valid(test) {
+                            local_valid += 1;
                         }
                     }
                 }
-                total_validations.fetch_add(local_validations, Ordering::Relaxed);
-            })
-        })
-        .collect();
+                valid_count_clone.fetch_add(local_valid, Ordering::Relaxed);
+            }));
+        }
 
-    for handle in handles {
-        handle.join().unwrap();
+        for handle in threads {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        let duration_ms = duration.as_millis() as i64;
+        
+        println!("Time: {} ms", duration_ms);
+        println!("Operations: {}", total_ops_per_method);
+        println!(
+            "Throughput: {} ops/sec",
+            (total_ops_per_method * 1000) / (duration_ms + 1) // +1 to avoid div by zero
+        );
+        println!("Valid emails found: {}", valid_count.load(Ordering::Relaxed));
+        println!(
+            "Avg latency: {:.2} ns/op\n",
+            (duration.as_nanos() as f64) / (total_ops_per_method as f64)
+        );
     }
 
-    let duration = start.elapsed();
-    let total_ops = (num_threads * iterations_per_thread * test_cases.len()) as u128;
-    let ops_per_sec = (total_ops * 1000) / duration.as_millis();
-
-    println!("\n{}", "-".repeat(100));
-    println!("RESULTS:");
+    // ============================================================================
+    // BENCHMARK 2: contains() - Fast Email Detection
+    // ============================================================================
     println!("{}", "-".repeat(100));
-    println!("Time: {} ms", duration.as_millis());
-    println!("Ops/sec: {}", ops_per_sec);
-    println!("Validations: {}", total_validations.load(Ordering::Relaxed));
+    println!("BENCHMARK 2: contains() - Fast Email Detection");
+    println!("{}", "-".repeat(100));
+    {
+        let start = Instant::now();
+        let found_count = Arc::new(AtomicI64::new(0));
+        let mut threads = Vec::new();
+
+        for _ in 0..num_threads {
+            let test_cases_clone = Arc::clone(&test_cases);
+            let found_count_clone = Arc::clone(&found_count);
+
+            threads.push(thread::spawn(move || {
+                let local_scanner = EmailValidatorFactory::create_scanner();
+                let mut local_found = 0;
+
+                for _ in 0..iterations_per_thread {
+                    for test in test_cases_clone.iter() {
+                        if local_scanner.contains(test) {
+                            local_found += 1;
+                        }
+                    }
+                }
+                found_count_clone.fetch_add(local_found, Ordering::Relaxed);
+            }));
+        }
+
+        for handle in threads {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        let duration_ms = duration.as_millis() as i64;
+
+        println!("Time: {} ms", duration_ms);
+        println!("Operations: {}", total_ops_per_method);
+        println!(
+            "Throughput: {} ops/sec",
+            (total_ops_per_method * 1000) / (duration_ms + 1)
+        );
+        println!(
+            "Texts with emails: {}",
+            found_count.load(Ordering::Relaxed)
+        );
+        println!(
+            "Avg latency: {:.2} ns/op\n",
+            (duration.as_nanos() as f64) / (total_ops_per_method as f64)
+        );
+    }
+
+    // ============================================================================
+    // BENCHMARK 3: extract() - Full Email Extraction
+    // ============================================================================
+    println!("{}", "-".repeat(100));
+    println!("BENCHMARK 3: extract() - Full Email Extraction");
+    println!("{}", "-".repeat(100));
+    {
+        let start = Instant::now();
+        let extracted_count = Arc::new(AtomicI64::new(0));
+        let mut threads = Vec::new();
+
+        for _ in 0..num_threads {
+            let test_cases_clone = Arc::clone(&test_cases);
+            let extracted_count_clone = Arc::clone(&extracted_count);
+
+            threads.push(thread::spawn(move || {
+                let local_scanner = EmailValidatorFactory::create_scanner();
+                let mut local_extracted = 0;
+
+                for _ in 0..iterations_per_thread {
+                    for test in test_cases_clone.iter() {
+                        let emails = local_scanner.extract(test);
+                        local_extracted += emails.len() as i64;
+                    }
+                }
+                extracted_count_clone.fetch_add(local_extracted, Ordering::Relaxed);
+            }));
+        }
+
+        for handle in threads {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        let duration_ms = duration.as_millis() as i64;
+
+        println!("Time: {} ms", duration_ms);
+        println!("Operations: {}", total_ops_per_method);
+        println!(
+            "Throughput: {} ops/sec",
+            (total_ops_per_method * 1000) / (duration_ms + 1)
+        );
+        println!(
+            "Emails extracted: {}",
+            extracted_count.load(Ordering::Relaxed)
+        );
+        println!(
+            "Avg latency: {:.2} ns/op\n",
+            (duration.as_nanos() as f64) / (total_ops_per_method as f64)
+        );
+    }
+
+    // ============================================================================
+    // BENCHMARK 4: Combined Workload (Real-world scenario)
+    // ============================================================================
+    println!("{}", "-".repeat(100));
+    println!("BENCHMARK 4: Combined Workload (Real-world)");
+    println!("{}", "-".repeat(100));
+    {
+        let start = Instant::now();
+        let total_operations = Arc::new(AtomicI64::new(0));
+        let mut threads = Vec::new();
+
+        for _ in 0..num_threads {
+            let test_cases_clone = Arc::clone(&test_cases);
+            let total_operations_clone = Arc::clone(&total_operations);
+
+            threads.push(thread::spawn(move || {
+                let local_validator = EmailValidatorFactory::create_validator();
+                let local_scanner = EmailValidatorFactory::create_scanner();
+                let mut local_ops = 0;
+
+                for _ in 0..iterations_per_thread {
+                    for test in test_cases_clone.iter() {
+                        // Real-world pattern: check first, extract if found
+                        if local_scanner.contains(test) {
+                            let emails = local_scanner.extract(test);
+                            local_ops += emails.len() as i64;
+                        }
+
+                        // Or validate exact emails
+                        if local_validator.is_valid(test) {
+                            local_ops += 1;
+                        }
+                    }
+                }
+                total_operations_clone.fetch_add(local_ops, Ordering::Relaxed);
+            }));
+        }
+
+        for handle in threads {
+            handle.join().unwrap();
+        }
+
+        let duration = start.elapsed();
+        let duration_ms = duration.as_millis() as i64;
+
+        println!("Time: {} ms", duration_ms);
+        println!("Operations: {}", total_ops_per_method);
+        println!(
+            "Throughput: {} ops/sec",
+            (total_ops_per_method * 1000) / (duration_ms + 1)
+        );
+        println!(
+            "Results produced: {}",
+            total_operations.load(Ordering::Relaxed)
+        );
+        println!(
+            "Avg latency: {:.2} ns/op\n",
+            (duration.as_nanos() as f64) / (total_ops_per_method as f64)
+        );
+    }
+
+    println!("{}", "=".repeat(100));
+    println!("✓ Performance Benchmark Complete");
     println!("{}\n", "=".repeat(100));
 }
 
