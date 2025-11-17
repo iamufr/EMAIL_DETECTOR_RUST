@@ -996,15 +996,13 @@ impl HeuristicEmailScanner {
         const MAX_LOCAL_PART: usize = 64;
         if (at_pos - start) > MAX_LOCAL_PART {
             did_trim = true;
-            start = at_pos - MAX_LOCAL_PART;
+            start = at_pos.saturating_sub(MAX_LOCAL_PART);
 
             while start < at_pos && text[start] == b'.' {
                 start += 1;
             }
 
-            if start > effective_min && start > 0 {
-                let prev_char = text[start - 1];
-
+            if let Some(&prev_char) = text.get(start.wrapping_sub(1)) {
                 if !CharacterClassifier::is_scan_boundary(prev_char)
                     && !CharacterClassifier::is_invalid_local_char(prev_char)
                     && prev_char != b'@'
@@ -1038,9 +1036,7 @@ impl HeuristicEmailScanner {
 
         let mut valid_boundaries = true;
 
-        if start > effective_min && start > 0 {
-            let prev_char = text[start - 1];
-
+        if let Some(&prev_char) = text.get(start.wrapping_sub(1)) {
             if did_trim {
                 valid_boundaries = true;
             } else if did_recovery {
