@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::thread;
 use std::time::Instant;
 
@@ -640,7 +640,44 @@ impl EmailValidator for RFC5322EmailValidator {
 }
 
 // ============================================================================
-// EMAIL SCANNER WITH HEURISTIC EXTRACTION
+// OPERATION BATCHER (For Performance with Security Limits)
+// ============================================================================
+
+struct OperationBatcher {
+    local_count: usize,
+}
+
+impl OperationBatcher {
+    const BATCH_SIZE: usize = 1000;
+
+    fn new() -> Self {
+        Self { local_count: 0 }
+    }
+
+    #[inline(always)]
+    fn record_operation(&mut self, counter: &AtomicUsize) {
+        self.local_count += 1;
+        if self.local_count >= Self::BATCH_SIZE {
+            counter.fetch_add(Self::BATCH_SIZE, Ordering::Relaxed);
+            self.local_count = 0;
+        }
+    }
+
+    #[inline(always)]
+    fn check_limit(&mut self, counter: &AtomicUsize, max_ops: usize) -> bool {
+        self.record_operation(counter);
+        counter.load(Ordering::Relaxed) > max_ops
+    }
+
+    fn flush(&self, counter: &AtomicUsize) {
+        if self.local_count > 0 {
+            counter.fetch_add(self.local_count, Ordering::Relaxed);
+        }
+    }
+}
+
+// ============================================================================
+// EMAIL SCANNER WITH HEURISTIC EXTRACTION + FULL SECURITY
 // ============================================================================
 
 struct EmailBoundaries {
@@ -654,10 +691,20 @@ struct EmailBoundaries {
 struct HeuristicEmailScanner;
 
 impl HeuristicEmailScanner {
+    // Security limits matching C++ implementation
     const MAX_INPUT_SIZE: usize = 10 * 1024 * 1024;
     const MAX_LEFT_SCAN: usize = 4096;
+    const MAX_EMAILS_EXTRACT: usize = 10000;
+    const MAX_BACKTRACK_PER_AT: usize = 330;
     const MAX_BACKWARD_SCAN_CHARS: usize = 200;
     const MAX_QUOTE_SCAN: usize = 100;
+    const MAX_MEMORY_BUDGET: usize = 5 * 1024 * 1024;
+    const MAX_INITIAL_RESERVE: usize = 100;
+    const MAX_AT_SYMBOLS: usize = 1000;
+    const MAX_SEEN_SET_SIZE: usize = 5000;
+    const MAX_TOTAL_OPERATIONS: usize = 100_000_000;
+    const MAX_SCAN_ITERATIONS: usize = 100_000;
+    const MAX_TOTAL_CHARS_SCANNED: usize = 1_000_000;
 
     #[inline(always)]
     fn find_first_alnum(data: &[u8], pos: usize, limit: usize) -> Option<usize> {
@@ -685,8 +732,20 @@ impl HeuristicEmailScanner {
         text: &[u8],
         at_pos: usize,
         min_scanned_index: usize,
+        op_counter: &AtomicUsize,
+        batcher: &mut OperationBatcher,
     ) -> EmailBoundaries {
         let len = text.len();
+
+        if batcher.check_limit(op_counter, Self::MAX_TOTAL_OPERATIONS) {
+            return EmailBoundaries {
+                start: at_pos,
+                end: at_pos,
+                valid_boundaries: false,
+                skip_to: at_pos,
+                did_trim_domain: false,
+            };
+        }
 
         if at_pos >= len {
             return EmailBoundaries {
@@ -712,9 +771,9 @@ impl HeuristicEmailScanner {
 
         const MAX_DOMAIN_PART: usize = 255;
         const MAX_LABEL_LENGTH: usize = 63;
-        let mut domain_chars = 0;
+        let mut domain_chars: usize = 0;
         let mut did_trim_domain = false;
-        let mut current_label_length = 0;
+        let mut current_label_length: usize = 0;
 
         while end < len && CharacterClassifier::is_domain_char(text[end]) {
             if domain_chars >= MAX_DOMAIN_PART {
@@ -734,6 +793,17 @@ impl HeuristicEmailScanner {
 
             end += 1;
             domain_chars += 1;
+
+            batcher.record_operation(op_counter);
+            if op_counter.load(Ordering::Relaxed) > Self::MAX_TOTAL_OPERATIONS {
+                return EmailBoundaries {
+                    start: at_pos,
+                    end: at_pos,
+                    valid_boundaries: false,
+                    skip_to: at_pos,
+                    did_trim_domain: false,
+                };
+            }
         }
 
         while end > at_pos + 1 && text[end - 1] == b'.' {
@@ -746,13 +816,13 @@ impl HeuristicEmailScanner {
             }
         }
 
+        let absolute_min = at_pos.saturating_sub(Self::MAX_LEFT_SCAN);
+
         if at_pos > 0
             && (text[at_pos - 1] == b'"' || text[at_pos - 1] == b'\'' || text[at_pos - 1] == b'`')
         {
             let closing_quote = text[at_pos - 1];
-            let mut quotes_seen = 0;
-
-            let absolute_min = at_pos.saturating_sub(Self::MAX_LEFT_SCAN);
+            let mut quotes_seen: usize = 0;
 
             if at_pos >= 2 {
                 for i in (absolute_min + 1..at_pos).rev() {
@@ -760,6 +830,17 @@ impl HeuristicEmailScanner {
                         break;
                     }
                     quotes_seen += 1;
+
+                    batcher.record_operation(op_counter);
+                    if op_counter.load(Ordering::Relaxed) > Self::MAX_TOTAL_OPERATIONS {
+                        return EmailBoundaries {
+                            start: at_pos,
+                            end: at_pos,
+                            valid_boundaries: false,
+                            skip_to: at_pos,
+                            did_trim_domain: false,
+                        };
+                    }
 
                     if quotes_seen > Self::MAX_QUOTE_SCAN {
                         break;
@@ -819,19 +900,24 @@ impl HeuristicEmailScanner {
             }
         }
 
+        let effective_min = min_scanned_index.max(absolute_min);
         let mut start = at_pos;
         let mut hit_invalid_char = false;
         let mut invalid_char_pos = at_pos;
         let mut did_recovery = false;
         let mut did_trim = false;
-        let mut chars_scanned = 0;
+        let mut chars_scanned: usize = 0;
 
-        let absolute_min = at_pos.saturating_sub(Self::MAX_LEFT_SCAN);
-        let effective_min = min_scanned_index.max(absolute_min);
-
-        while start > effective_min && chars_scanned < Self::MAX_BACKWARD_SCAN_CHARS {
-            if start == 0 {
-                break;
+        while start > effective_min && start > 0 && chars_scanned < Self::MAX_BACKWARD_SCAN_CHARS {
+            batcher.record_operation(op_counter);
+            if op_counter.load(Ordering::Relaxed) > Self::MAX_TOTAL_OPERATIONS {
+                return EmailBoundaries {
+                    start: at_pos,
+                    end: at_pos,
+                    valid_boundaries: false,
+                    skip_to: at_pos,
+                    did_trim_domain: false,
+                };
             }
 
             let prev_char = text[start - 1];
@@ -840,7 +926,7 @@ impl HeuristicEmailScanner {
                 break;
             }
 
-            if prev_char == b'.' && start > effective_min + 1 && start > 1 {
+            if prev_char == b'.' && start > 1 && start > effective_min + 1 {
                 if text[start - 2] == b'.' {
                     hit_invalid_char = true;
                     invalid_char_pos = start - 1;
@@ -849,11 +935,11 @@ impl HeuristicEmailScanner {
             }
 
             if CharacterClassifier::is_invalid_local_char(prev_char) {
-                if prev_char == b'@' && start > effective_min + 1 && start > 1 {
+                if prev_char == b'@' && start > 1 && start > effective_min + 1 {
                     let mut lookback = start - 2;
                     let mut found_valid = false;
                     let lookback_limit = effective_min;
-                    let mut lookback_iterations = 0;
+                    let mut lookback_iterations: usize = 0;
                     const MAX_LOOKBACK_ITERATIONS: usize = 100;
 
                     loop {
@@ -863,6 +949,17 @@ impl HeuristicEmailScanner {
                             || lookback_iterations >= MAX_LOOKBACK_ITERATIONS
                         {
                             break;
+                        }
+
+                        batcher.record_operation(op_counter);
+                        if op_counter.load(Ordering::Relaxed) > Self::MAX_TOTAL_OPERATIONS {
+                            return EmailBoundaries {
+                                start: at_pos,
+                                end: at_pos,
+                                valid_boundaries: false,
+                                skip_to: at_pos,
+                                did_trim_domain: false,
+                            };
                         }
 
                         let c = text[lookback];
@@ -883,7 +980,6 @@ impl HeuristicEmailScanner {
                     }
 
                     if found_valid {
-                        chars_scanned += 1;
                         continue;
                     }
                 }
@@ -894,7 +990,7 @@ impl HeuristicEmailScanner {
             }
 
             if CharacterClassifier::is_quote_char(prev_char) {
-                if start > effective_min + 1 && start > 1 && text[start - 2] == prev_char {
+                if start > 1 && start > effective_min + 1 && text[start - 2] == prev_char {
                     start -= 1;
                     chars_scanned += 1;
                     continue;
@@ -914,7 +1010,7 @@ impl HeuristicEmailScanner {
                 if has_matching_quote {
                     break;
                 } else {
-                    if start > effective_min + 1 && start > 1 {
+                    if start > 1 && start > effective_min + 1 {
                         let prev_prev_char = text[start - 2];
                         if prev_prev_char == b'='
                             || prev_prev_char == b':'
@@ -1110,11 +1206,20 @@ impl EmailScanner for HeuristicEmailScanner {
         }
 
         let bytes = text.as_bytes();
-        let mut pos = 0;
-        let min_scanned_index = 0;
-        let last_consumed_end = 0;
+        let mut pos: usize = 0;
+        let min_scanned_index: usize = 0;
+        let last_consumed_end: usize = 0;
+
+        let total_ops = AtomicUsize::new(0);
+        let mut batcher = OperationBatcher::new();
+
+        let mut total_chars_scanned: usize = 0;
 
         while pos < len {
+            if batcher.check_limit(&total_ops, Self::MAX_TOTAL_OPERATIONS) {
+                break;
+            }
+
             let at_pos = match bytes[pos..].iter().position(|&b| b == b'@') {
                 Some(offset) => pos + offset,
                 None => break,
@@ -1130,7 +1235,26 @@ impl EmailScanner for HeuristicEmailScanner {
                 continue;
             }
 
-            let boundaries = Self::find_email_boundaries(bytes, at_pos, min_scanned_index);
+            let boundaries = Self::find_email_boundaries(
+                bytes,
+                at_pos,
+                min_scanned_index,
+                &total_ops,
+                &mut batcher,
+            );
+
+            let chars_scanned: usize = (at_pos.saturating_sub(boundaries.start))
+                .saturating_add(boundaries.end.saturating_sub(at_pos));
+
+            if chars_scanned > Self::MAX_BACKTRACK_PER_AT {
+                pos = at_pos + 1;
+                continue;
+            }
+
+            total_chars_scanned = total_chars_scanned.saturating_add(chars_scanned);
+            if total_chars_scanned > Self::MAX_TOTAL_CHARS_SCANNED {
+                break;
+            }
 
             if !boundaries.valid_boundaries {
                 pos = if boundaries.skip_to > 0 {
@@ -1161,6 +1285,7 @@ impl EmailScanner for HeuristicEmailScanner {
             pos = at_pos + 1;
         }
 
+        batcher.flush(&total_ops);
         false
     }
 
@@ -1171,19 +1296,55 @@ impl EmailScanner for HeuristicEmailScanner {
             return Vec::new();
         }
 
-        let mut emails = Vec::new();
-        let mut seen = HashSet::new();
+        let initial_reserve = Self::MAX_INITIAL_RESERVE.min(len / 30).min(10);
+
+        let mut emails = Vec::with_capacity(initial_reserve);
+
+        let expected_unique = (len / 30)
+            .min(Self::MAX_EMAILS_EXTRACT)
+            .min(Self::MAX_SEEN_SET_SIZE);
+        let reserve_size = (expected_unique * 13 / 10)
+            .saturating_add(1)
+            .min(Self::MAX_SEEN_SET_SIZE);
+        let mut seen = HashSet::with_capacity(reserve_size);
 
         let bytes = text.as_bytes();
-        let mut pos = 0;
-        let mut min_scanned_index = 0;
-        let mut last_consumed_end = 0;
+        let mut pos: usize = 0;
+        let mut min_scanned_index: usize = 0;
+        let mut last_consumed_end: usize = 0;
 
-        while pos < len {
+        let mut extracted_count: usize = 0;
+        let mut at_symbols_processed: usize = 0;
+
+        let total_ops = AtomicUsize::new(0);
+        let mut batcher = OperationBatcher::new();
+
+        let mut iterations: usize = 0;
+        let mut total_chars_scanned: usize = 0;
+
+        let mut estimated_memory: usize = 0;
+
+        while pos < len && iterations < Self::MAX_SCAN_ITERATIONS {
+            iterations += 1;
+
+            if batcher.check_limit(&total_ops, Self::MAX_TOTAL_OPERATIONS) {
+                break;
+            }
+
+            if extracted_count >= Self::MAX_EMAILS_EXTRACT {
+                break;
+            }
+
+            if at_symbols_processed >= Self::MAX_AT_SYMBOLS {
+                break;
+            }
+
             let at_pos = match bytes[pos..].iter().position(|&b| b == b'@') {
                 Some(offset) => pos + offset,
                 None => break,
             };
+
+            at_symbols_processed += 1;
 
             if at_pos < 1 || at_pos >= len - 3 {
                 pos = at_pos + 1;
@@ -1195,7 +1356,26 @@ impl EmailScanner for HeuristicEmailScanner {
                 continue;
             }
 
-            let boundaries = Self::find_email_boundaries(bytes, at_pos, min_scanned_index);
+            let boundaries = Self::find_email_boundaries(
+                bytes,
+                at_pos,
+                min_scanned_index,
+                &total_ops,
+                &mut batcher,
+            );
+
+            let chars_scanned: usize = (at_pos.saturating_sub(boundaries.start))
+                .saturating_add(boundaries.end.saturating_sub(at_pos));
+
+            if chars_scanned > Self::MAX_BACKTRACK_PER_AT {
+                pos = at_pos + 1;
+                continue;
+            }
+
+            total_chars_scanned = total_chars_scanned.saturating_add(chars_scanned);
+            if total_chars_scanned > Self::MAX_TOTAL_CHARS_SCANNED {
+                break;
+            }
 
             if !boundaries.valid_boundaries {
                 pos = if boundaries.skip_to > 0 {
@@ -1230,8 +1410,35 @@ impl EmailScanner for HeuristicEmailScanner {
 
                 let email = &text[boundaries.start..boundaries.end];
 
+                let email_memory: usize = email.len()
+                    + std::mem::size_of::<String>()
+                    + std::mem::size_of::<*const ()>() * 2;
+
+                let new_memory: usize = estimated_memory.saturating_add(email_memory);
+                if new_memory > Self::MAX_MEMORY_BUDGET {
+                    break;
+                }
+
+                if seen.len() >= Self::MAX_SEEN_SET_SIZE {
+                    break;
+                }
+
+                if emails.len() >= emails.capacity() {
+                    let new_capacity = emails.len() + 1;
+                    let additional_memory: usize = new_capacity * std::mem::size_of::<String>();
+
+                    let capacity_memory: usize = new_memory.saturating_add(additional_memory);
+                    if capacity_memory > Self::MAX_MEMORY_BUDGET {
+                        break;
+                    }
+
+                    emails.reserve(1);
+                }
+
                 if seen.insert(email.to_string()) {
                     emails.push(email.to_string());
+                    estimated_memory = new_memory;
+                    extracted_count += 1;
                 }
 
                 min_scanned_index = min_scanned_index.max(boundaries.start);
@@ -1265,6 +1472,7 @@ impl EmailScanner for HeuristicEmailScanner {
             pos = at_pos + 1;
         }
 
+        batcher.flush(&total_ops);
         emails
     }
 }
@@ -3607,10 +3815,7 @@ fn run_performance_benchmark() {
     println!("  Threads: {}", num_threads);
     println!("  Iterations per thread: {}", iterations_per_thread);
     println!("  Test cases: {}", num_test_cases);
-    println!(
-        "  Total operations per method: {}",
-        total_ops_per_method
-    );
+    println!("  Total operations per method: {}", total_ops_per_method);
 
     // ============================================================================
     // BENCHMARK 1: isValid() - Exact Email Validation
@@ -3648,14 +3853,17 @@ fn run_performance_benchmark() {
 
         let duration = start.elapsed();
         let duration_ms = duration.as_millis() as i64;
-        
+
         println!("Time: {} ms", duration_ms);
         println!("Operations: {}", total_ops_per_method);
         println!(
             "Throughput: {} ops/sec",
             (total_ops_per_method * 1000) / (duration_ms + 1) // +1 to avoid div by zero
         );
-        println!("Valid emails found: {}", valid_count.load(Ordering::Relaxed));
+        println!(
+            "Valid emails found: {}",
+            valid_count.load(Ordering::Relaxed)
+        );
         println!(
             "Avg latency: {:.2} ns/op\n",
             (duration.as_nanos() as f64) / (total_ops_per_method as f64)
@@ -3705,10 +3913,7 @@ fn run_performance_benchmark() {
             "Throughput: {} ops/sec",
             (total_ops_per_method * 1000) / (duration_ms + 1)
         );
-        println!(
-            "Texts with emails: {}",
-            found_count.load(Ordering::Relaxed)
-        );
+        println!("Texts with emails: {}", found_count.load(Ordering::Relaxed));
         println!(
             "Avg latency: {:.2} ns/op\n",
             (duration.as_nanos() as f64) / (total_ops_per_method as f64)
