@@ -2195,6 +2195,27 @@ fn run_text_scanning_tests() {
             description: "@ inside double quotes allowed in Local Part".to_string(),
         },
         ScanTestCase {
+            input: r#"In this paragraph there are some emails "user123beta0abcxyz8564jftieeiowreoi9845454jfoieie@internal.com"@example.com please find out them...!"#.to_string(),
+            should_find: true,
+            expected_emails: vec![
+                "user123beta0abcxyz8564jftieeiowreoi9845454jfoieie@internal.com".to_string(),
+                r#""user123beta0abcxyz8564jftieeiowreoi9845454jfoieie@internal.com"@example.com"#.to_string()
+            ],
+            description: "@ inside double quotes allowed in Local Part".to_string(),
+        },
+        ScanTestCase {
+            input: r#"In this paragraph there are some emails "user0alp123[cxyz8564jftieeiowreoi9845454jfoieie ] internal.com"@example.com please find out them...!"#.to_string(),
+            should_find: true,
+            expected_emails: vec![r#""user0alp123[cxyz8564jftieeiowreoi9845454jfoieie ] internal.com"@example.com"#.to_string()],
+            description: "@ inside double quotes allowed in Local Part".to_string(),
+        },
+        ScanTestCase {
+            input: r#"In this paragraph there are some emails "user0alpha1238564jftieeiowreoi9845454jfoieie=_+(internal)..com"@example.com please find out them...!"#.to_string(),
+            should_find: true,
+            expected_emails: vec![r#""user0alpha1238564jftieeiowreoi9845454jfoieie=_+(internal)..com"@example.com"#.to_string()],
+            description: "@ inside double quotes allowed in Local Part".to_string(),
+        },
+        ScanTestCase {
             input: "user@domain.com@".to_string(),
             should_find: true,
             expected_emails: vec!["user@domain.com".to_string()],
