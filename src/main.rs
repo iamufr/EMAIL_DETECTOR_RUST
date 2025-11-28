@@ -1,27 +1,271 @@
+#![forbid(unsafe_code)]
+#![deny(clippy::all)]
+#![warn(clippy::pedantic)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::similar_names)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::cast_possible_truncation)]
+
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
-use std::thread;
+use std::sync::{
+    Arc, RwLock,
+    atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering},
+};
 use std::time::Instant;
+use std::{thread, thread_local};
 
 // ============================================================================
-// INTERFACES (SOLID: Interface Segregation Principle)
+// SAFE ARITHMETIC UTILITIES (Overflow-Safe)
 // ============================================================================
 
-trait EmailValidator: Send + Sync {
-    fn is_valid(&self, email: &str) -> bool;
+pub mod safe_arithmetic {
+    /// Performs checked addition, returning false on overflow
+    #[inline]
+    #[must_use]
+    pub const fn add(a: usize, b: usize) -> (usize, bool) {
+        match a.checked_add(b) {
+            Some(result) => (result, true),
+            None => (usize::MAX, false),
+        }
+    }
+
+    /// Performs checked subtraction, returning false on underflow
+    #[inline]
+    #[must_use]
+    pub const fn subtract(a: usize, b: usize) -> (usize, bool) {
+        match a.checked_sub(b) {
+            Some(result) => (result, true),
+            None => (0, false),
+        }
+    }
+
+    /// Performs checked multiplication, returning false on overflow
+    #[inline]
+    #[must_use]
+    pub const fn multiply(a: usize, b: usize) -> (usize, bool) {
+        match a.checked_mul(b) {
+            Some(result) => (result, true),
+            None => (usize::MAX, false),
+        }
+    }
+
+    /// Saturating addition - clamps at `usize::MAX`
+    #[inline]
+    #[must_use]
+    pub const fn saturating_add(a: usize, b: usize) -> usize {
+        a.saturating_add(b)
+    }
+
+    /// Saturating subtraction - clamps at 0
+    #[inline]
+    #[must_use]
+    pub const fn saturating_subtract(a: usize, b: usize) -> usize {
+        a.saturating_sub(b)
+    }
 }
 
-trait EmailScanner: Send + Sync {
-    fn contains(&self, text: &str) -> bool;
-    fn extract(&self, text: &str) -> Vec<String>;
+// ============================================================================
+// ERROR TRACKING (Thread-Safe with Acquire-Release Semantics)
+// ============================================================================
+
+#[derive(Debug, Default)]
+pub struct ThreadSafeErrorCounter {
+    counter: AtomicU64,
+}
+
+impl ThreadSafeErrorCounter {
+    /// Creates a new error counter initialized to zero
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            counter: AtomicU64::new(0),
+        }
+    }
+
+    /// Records an error occurrence
+    #[inline]
+    pub fn record_error(&self) {
+        self.counter.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Gets the current error count
+    #[inline]
+    #[must_use]
+    pub fn get_count(&self) -> u64 {
+        self.counter.load(Ordering::Acquire)
+    }
+
+    /// Resets the counter to zero
+    #[inline]
+    pub fn reset(&self) {
+        self.counter.store(0, Ordering::Release);
+    }
+
+    /// Returns a reference to the global error counter instance
+    #[must_use]
+    pub fn global() -> &'static Self {
+        static INSTANCE: ThreadSafeErrorCounter = ThreadSafeErrorCounter::new();
+        &INSTANCE
+    }
 }
 
 // ============================================================================
-// CHARACTER CLASSIFICATION (Lookup Tables)
+// STATISTICS TRACKER (Thread-Safe with Consistent Snapshots)
 // ============================================================================
 
-struct CharacterClassifier;
+/// Snapshot of validation statistics at a point in time
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StatsSnapshot {
+    pub validations: u64,
+    pub scans: u64,
+    pub extracts: u64,
+    pub errors: u64,
+}
+
+impl StatsSnapshot {
+    /// Calculates the error rate (errors / validations)
+    #[must_use]
+    pub fn get_error_rate(&self) -> f64 {
+        if self.validations > 0 {
+            self.errors as f64 / self.validations as f64
+        } else {
+            0.0
+        }
+    }
+
+    /// Gets the number of successful validations
+    #[must_use]
+    pub fn get_success_count(&self) -> u64 {
+        self.validations.saturating_sub(self.errors)
+    }
+
+    /// Checks if any errors occurred
+    #[must_use]
+    pub const fn has_errors(&self) -> bool {
+        self.errors > 0
+    }
+}
+
+#[derive(Debug)]
+pub struct ValidationStats {
+    // Cache-line aligned for reduced false sharing
+    validation_count: AtomicU64,
+    scan_count: AtomicU64,
+    extract_count: AtomicU64,
+    error_count: AtomicU64,
+    // Mutex for consistent snapshots
+    snapshot_lock: RwLock<()>,
+}
+
+impl Default for ValidationStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ValidationStats {
+    /// Creates a new statistics tracker
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            validation_count: AtomicU64::new(0),
+            scan_count: AtomicU64::new(0),
+            extract_count: AtomicU64::new(0),
+            error_count: AtomicU64::new(0),
+            snapshot_lock: RwLock::new(()),
+        }
+    }
+
+    /// Records a validation operation
+    #[inline]
+    pub fn record_validation(&self) {
+        self.validation_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records a scan operation
+    #[inline]
+    pub fn record_scan(&self) {
+        self.scan_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records an extract operation
+    #[inline]
+    pub fn record_extract(&self) {
+        self.extract_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Records an error
+    #[inline]
+    pub fn record_error(&self) {
+        self.error_count.fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Gets validation count (individual read, may be inconsistent with other counters)
+    #[inline]
+    #[must_use]
+    pub fn get_validation_count(&self) -> u64 {
+        self.validation_count.load(Ordering::Acquire)
+    }
+
+    /// Gets scan count (individual read, may be inconsistent with other counters)
+    #[inline]
+    #[must_use]
+    pub fn get_scan_count(&self) -> u64 {
+        self.scan_count.load(Ordering::Acquire)
+    }
+
+    /// Gets extract count (individual read, may be inconsistent with other counters)
+    #[inline]
+    #[must_use]
+    pub fn get_extract_count(&self) -> u64 {
+        self.extract_count.load(Ordering::Acquire)
+    }
+
+    /// Gets error count (individual read, may be inconsistent with other counters)
+    #[inline]
+    #[must_use]
+    pub fn get_error_count(&self) -> u64 {
+        self.error_count.load(Ordering::Acquire)
+    }
+
+    /// Resets all counters to zero (thread-safe)
+    pub fn reset(&self) {
+        let _guard = self.snapshot_lock.write().expect("Lock poisoned");
+        self.validation_count.store(0, Ordering::Release);
+        self.scan_count.store(0, Ordering::Release);
+        self.extract_count.store(0, Ordering::Release);
+        self.error_count.store(0, Ordering::Release);
+    }
+
+    /// Gets a consistent snapshot of all statistics
+    #[must_use]
+    pub fn get_snapshot(&self) -> StatsSnapshot {
+        let _guard = self.snapshot_lock.read().expect("Lock poisoned");
+        StatsSnapshot {
+            validations: self.validation_count.load(Ordering::Acquire),
+            scans: self.scan_count.load(Ordering::Acquire),
+            extracts: self.extract_count.load(Ordering::Acquire),
+            errors: self.error_count.load(Ordering::Acquire),
+        }
+    }
+
+    /// Gets a relaxed (potentially inconsistent) snapshot for monitoring
+    #[must_use]
+    pub fn get_relaxed_snapshot(&self) -> StatsSnapshot {
+        StatsSnapshot {
+            validations: self.validation_count.load(Ordering::Relaxed),
+            scans: self.scan_count.load(Ordering::Relaxed),
+            extracts: self.extract_count.load(Ordering::Relaxed),
+            errors: self.error_count.load(Ordering::Relaxed),
+        }
+    }
+}
+
+// ============================================================================
+// CHARACTER CLASSIFICATION (Lookup Tables - Thread-Safe, Read-Only)
+// ============================================================================
+
+pub struct CharacterClassifier;
 
 impl CharacterClassifier {
     const CHAR_ALPHA: u8 = 0x01;
@@ -33,111 +277,209 @@ impl CharacterClassifier {
     const CHAR_INVALID_LOCAL: u8 = 0x40;
     const CHAR_BOUNDARY: u8 = 0x80;
 
-    const CHAR_TABLE: [u8; 256] = [
-        // 0-31: control characters
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0xC0, 0xC0, 0x40, 0x40, 0xC0, 0x40,
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, // 32-47: space and symbols
-        0xC0, 0x04, 0x60, 0x04, 0x04, 0x04, 0x04, 0x24, 0xC0, 0xC0, 0x04, 0x04, 0xC0, 0x14, 0x14,
-        0x04, // 48-63: digits and more symbols
-        0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0x1A, 0xC0, 0xC0, 0xC0, 0x04, 0xC0,
-        0x04, // 64-79: @ and uppercase letters
-        0x40, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
-        0x11, // 80-95: more uppercase and symbols
-        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0xC0, 0x40, 0xC0, 0x04,
-        0x04, // 96-111: backtick and lowercase letters
-        0x24, 0x19, 0x19, 0x19, 0x19, 0x19, 0x19, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11,
-        0x11, // 112-127: more lowercase and symbols
-        0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x04, 0x04, 0x04, 0x04,
-        0x40, // 128-255: extended ASCII (invalid)
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-        0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40, 0x40,
-    ];
+    /// Lookup table for character classification (256 entries for all bytes)
+    const CHAR_TABLE: [u8; 256] = Self::build_char_table();
 
-    #[allow(dead_code)]
+    /// Builds the character classification table at compile time
+    const fn build_char_table() -> [u8; 256] {
+        let mut table = [0u8; 256];
+
+        // Control characters (0-31)
+        let mut i = 0;
+        while i < 32 {
+            table[i] = Self::CHAR_INVALID_LOCAL;
+            i += 1;
+        }
+
+        // Whitespace as boundaries
+        table[9] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // Tab
+        table[10] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // LF
+        table[13] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // CR
+
+        // Printable ASCII (32-47)
+        table[32] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // Space
+        table[33] = Self::CHAR_ATEXT_SPECIAL; // !
+        table[34] = Self::CHAR_QUOTE | Self::CHAR_INVALID_LOCAL; // "
+        table[35] = Self::CHAR_ATEXT_SPECIAL; // #
+        table[36] = Self::CHAR_ATEXT_SPECIAL; // $
+        table[37] = Self::CHAR_ATEXT_SPECIAL; // %
+        table[38] = Self::CHAR_ATEXT_SPECIAL; // &
+        table[39] = Self::CHAR_ATEXT_SPECIAL | Self::CHAR_QUOTE; // '
+        table[40] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // (
+        table[41] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // )
+        table[42] = Self::CHAR_ATEXT_SPECIAL; // *
+        table[43] = Self::CHAR_ATEXT_SPECIAL; // +
+        table[44] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // ,
+        table[45] = Self::CHAR_ATEXT_SPECIAL | Self::CHAR_DOMAIN; // -
+        table[46] = Self::CHAR_DOMAIN; // .
+        table[47] = Self::CHAR_ATEXT_SPECIAL; // /
+
+        // Digits 0-9 (48-57)
+        i = 48;
+        while i <= 57 {
+            table[i] = Self::CHAR_ALPHA | Self::CHAR_DIGIT | Self::CHAR_HEX | Self::CHAR_DOMAIN;
+            i += 1;
+        }
+
+        // Symbols (58-64)
+        table[58] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // :
+        table[59] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // ;
+        table[60] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // <
+        table[61] = Self::CHAR_ATEXT_SPECIAL; // =
+        table[62] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // >
+        table[63] = Self::CHAR_ATEXT_SPECIAL; // ?
+        table[64] = Self::CHAR_INVALID_LOCAL; // @
+
+        // Uppercase A-F (hex) (65-70)
+        i = 65;
+        while i <= 70 {
+            table[i] = Self::CHAR_ALPHA | Self::CHAR_HEX | Self::CHAR_DOMAIN;
+            i += 1;
+        }
+
+        // Uppercase G-Z (71-90)
+        i = 71;
+        while i <= 90 {
+            table[i] = Self::CHAR_ALPHA | Self::CHAR_DOMAIN;
+            i += 1;
+        }
+
+        // Symbols (91-96)
+        table[91] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // [
+        table[92] = Self::CHAR_INVALID_LOCAL; // backslash
+        table[93] = Self::CHAR_INVALID_LOCAL | Self::CHAR_BOUNDARY; // ]
+        table[94] = Self::CHAR_ATEXT_SPECIAL; // ^
+        table[95] = Self::CHAR_ATEXT_SPECIAL; // _
+        table[96] = Self::CHAR_ATEXT_SPECIAL | Self::CHAR_QUOTE; // `
+
+        // Lowercase a-f (hex) (97-102)
+        i = 97;
+        while i <= 102 {
+            table[i] = Self::CHAR_ALPHA | Self::CHAR_HEX | Self::CHAR_DOMAIN;
+            i += 1;
+        }
+
+        // Lowercase g-z (103-122)
+        i = 103;
+        while i <= 122 {
+            table[i] = Self::CHAR_ALPHA | Self::CHAR_DOMAIN;
+            i += 1;
+        }
+
+        // Symbols (123-127)
+        table[123] = Self::CHAR_ATEXT_SPECIAL; // {
+        table[124] = Self::CHAR_ATEXT_SPECIAL; // |
+        table[125] = Self::CHAR_ATEXT_SPECIAL; // }
+        table[126] = Self::CHAR_ATEXT_SPECIAL; // ~
+        table[127] = Self::CHAR_INVALID_LOCAL; // DEL
+
+        // Extended ASCII (128-255) - all invalid
+        i = 128;
+        while i < 256 {
+            table[i] = Self::CHAR_INVALID_LOCAL;
+            i += 1;
+        }
+
+        table
+    }
+
     #[inline(always)]
-    fn is_alpha(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_alpha(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize] & Self::CHAR_ALPHA) != 0
     }
 
     #[inline(always)]
-    fn is_digit(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_digit(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize] & Self::CHAR_DIGIT) != 0
     }
 
     #[inline(always)]
-    fn is_alpha_num(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_alpha_num(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize] & (Self::CHAR_ALPHA | Self::CHAR_DIGIT)) != 0
     }
 
     #[inline(always)]
-    fn is_hex_digit(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_hex_digit(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize] & Self::CHAR_HEX) != 0
     }
 
     #[inline(always)]
-    fn is_atext(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_atext(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize]
             & (Self::CHAR_ALPHA | Self::CHAR_DIGIT | Self::CHAR_ATEXT_SPECIAL))
             != 0
     }
 
     #[inline(always)]
-    fn is_domain_char(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_domain_char(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize] & Self::CHAR_DOMAIN) != 0
     }
 
     #[inline(always)]
-    fn is_scan_boundary(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_scan_boundary(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize] & Self::CHAR_BOUNDARY) != 0
     }
 
     #[inline(always)]
-    fn is_scan_right_boundary(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_scan_right_boundary(c: u8) -> bool {
         Self::is_scan_boundary(c) || c == b'.' || c == b'!' || c == b'?'
     }
 
     #[inline(always)]
-    fn is_invalid_local_char(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_invalid_local_char(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize] & Self::CHAR_INVALID_LOCAL) != 0
     }
 
     #[inline(always)]
-    fn is_quote_char(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_quote_char(c: u8) -> bool {
         (Self::CHAR_TABLE[c as usize] & Self::CHAR_QUOTE) != 0
     }
 
     #[inline(always)]
-    fn is_qtext_or_qpair(c: u8) -> bool {
+    #[must_use]
+    pub const fn is_qtext_or_qpair(c: u8) -> bool {
         c >= 33 && c <= 126 && c != b'\\' && c != b'"'
     }
 }
 
 // ============================================================================
-// LOCAL PART VALIDATOR
+// LOCAL PART VALIDATOR (Stateless - Thread-Safe)
 // ============================================================================
 
-#[derive(Copy, Clone)]
-enum ValidationMode {
+/// Validation mode for local part parsing
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ValidationMode {
+    /// Exact RFC 5322 validation
     Exact,
+    /// Relaxed validation for scanning/extraction
     Scan,
 }
 
-struct LocalPartValidator;
+/// Stateless local part validator (thread-safe by design)
+pub struct LocalPartValidator;
 
 impl LocalPartValidator {
     const MAX_LOCAL_PART: usize = 64;
 
-    #[inline(always)]
+    /// Validates a dot-atom format local part
+    #[inline]
     fn validate_dot_atom(text: &[u8], start: usize, end: usize) -> bool {
-        if start >= end || end > text.len() || (end - start) > Self::MAX_LOCAL_PART {
+        if start >= end || end > text.len() {
+            return false;
+        }
+
+        let part_len = end - start;
+        if part_len > Self::MAX_LOCAL_PART {
             return false;
         }
 
@@ -163,10 +505,14 @@ impl LocalPartValidator {
         true
     }
 
+    /// Validates a quoted-string format local part
     fn validate_quoted_string(text: &[u8], start: usize, end: usize) -> bool {
-        let len = text.len();
+        if start >= end || end > text.len() {
+            return false;
+        }
 
-        if start >= end || end > len || (end - start) > (Self::MAX_LOCAL_PART + 2) {
+        let part_len = end - start;
+        if part_len > Self::MAX_LOCAL_PART + 2 || part_len < 3 {
             return false;
         }
 
@@ -174,16 +520,8 @@ impl LocalPartValidator {
             return false;
         }
 
-        if (end - start) < 3 {
-            return false;
-        }
-
         let mut escaped = false;
         for i in (start + 1)..(end - 1) {
-            if i >= len {
-                return false;
-            }
-
             let c = text[i];
             if escaped {
                 if c > 127 {
@@ -201,11 +539,15 @@ impl LocalPartValidator {
         !escaped
     }
 
-    #[inline(always)]
+    /// Validates local part in scan mode (relaxed for extraction)
+    #[inline]
     fn validate_scan_mode(text: &[u8], start: usize, end: usize) -> bool {
-        let len = text.len();
+        if start >= end || end > text.len() {
+            return false;
+        }
 
-        if start >= end || end > len || (end - start) > Self::MAX_LOCAL_PART {
+        let part_len = end - start;
+        if part_len > Self::MAX_LOCAL_PART {
             return false;
         }
 
@@ -215,10 +557,6 @@ impl LocalPartValidator {
 
         let mut prev_dot = false;
         for i in start..end {
-            if i >= len {
-                return false;
-            }
-
             let c = text[i];
             if c == b'.' {
                 if prev_dot {
@@ -235,37 +573,45 @@ impl LocalPartValidator {
         true
     }
 
-    #[inline(always)]
-    fn validate(text: &[u8], start: usize, end: usize, mode: ValidationMode) -> bool {
+    /// Validates a local part with the specified mode
+    #[inline]
+    #[must_use]
+    pub fn validate(text: &[u8], start: usize, end: usize, mode: ValidationMode) -> bool {
         if start >= end || end > text.len() {
             return false;
         }
 
-        if matches!(mode, ValidationMode::Scan) {
-            return Self::validate_scan_mode(text, start, end);
+        match mode {
+            ValidationMode::Scan => Self::validate_scan_mode(text, start, end),
+            ValidationMode::Exact => {
+                if text[start] == b'"' {
+                    Self::validate_quoted_string(text, start, end)
+                } else {
+                    Self::validate_dot_atom(text, start, end)
+                }
+            }
         }
-
-        if text[start] == b'"' {
-            return Self::validate_quoted_string(text, start, end);
-        }
-        Self::validate_dot_atom(text, start, end)
     }
 }
 
 // ============================================================================
-// DOMAIN PART VALIDATOR
+// DOMAIN PART VALIDATOR (Stateless - Thread-Safe)
 // ============================================================================
 
-struct DomainPartValidator;
+pub struct DomainPartValidator;
 
 impl DomainPartValidator {
     const MAX_DOMAIN_PART: usize = 253;
     const MAX_LABEL_LENGTH: usize = 63;
 
+    /// Validates domain labels (standard domain format)
     fn validate_domain_labels(text: &[u8], start: usize, end: usize) -> bool {
-        let len = text.len();
+        if start >= end || end > text.len() {
+            return false;
+        }
 
-        if start >= end || end > len || (end - start) < 1 || (end - start) > Self::MAX_DOMAIN_PART {
+        let domain_len = end - start;
+        if domain_len < 1 || domain_len > Self::MAX_DOMAIN_PART {
             return false;
         }
 
@@ -277,43 +623,30 @@ impl DomainPartValidator {
             return false;
         }
 
-        let mut prev_dot = false;
-        for i in start..end {
-            if i >= len {
+        // Check for consecutive dots
+        for i in start..(end - 1) {
+            if text[i] == b'.' && text[i + 1] == b'.' {
                 return false;
             }
-
-            if text[i] == b'.' {
-                if prev_dot {
-                    return false;
-                }
-                prev_dot = true;
-            } else {
-                prev_dot = false;
-            }
         }
 
+        // Find last dot for TLD validation
         let mut last_dot_pos = None;
-        if end > start {
-            for i in (start..end).rev() {
-                if text[i] == b'.' {
-                    last_dot_pos = Some(i);
-                    break;
-                }
+        for i in (start..end).rev() {
+            if text[i] == b'.' {
+                last_dot_pos = Some(i);
+                break;
             }
         }
 
+        // Validate labels
         let mut label_start = start;
-        let mut label_count = 0;
+        let mut label_count = 0u32;
 
         for i in start..=end {
             if i == end || text[i] == b'.' {
                 let label_len = i - label_start;
                 if label_len == 0 || label_len > Self::MAX_LABEL_LENGTH {
-                    return false;
-                }
-
-                if label_start >= len || (label_start + label_len) > len {
                     return false;
                 }
 
@@ -337,9 +670,10 @@ impl DomainPartValidator {
             return false;
         }
 
+        // TLD validation for multi-label domains
         if label_count >= 2 {
-            if let Some(last_dot_pos) = last_dot_pos {
-                let tld_start = last_dot_pos + 1;
+            if let Some(last_dot) = last_dot_pos {
+                let tld_start = last_dot + 1;
                 if tld_start >= end {
                     return false;
                 }
@@ -355,86 +689,87 @@ impl DomainPartValidator {
         true
     }
 
+    /// Validates IPv4 address format
     fn validate_ipv4(text: &[u8], start: usize, end: usize) -> bool {
         if start >= end || end > text.len() {
             return false;
         }
 
-        let mut octets = Vec::new();
-        let mut num_start = start;
+        let mut octet_idx = 0u32;
+        let mut pos = start;
 
-        for i in start..=end {
-            if i == end || text[i] == b'.' {
-                if i == num_start || num_start >= end {
+        while pos < end && octet_idx < 4 {
+            // Find end of this octet
+            let mut octet_end = pos;
+            while octet_end < end && text[octet_end] != b'.' {
+                octet_end += 1;
+            }
+
+            // Empty octet is invalid
+            if octet_end == pos {
+                return false;
+            }
+
+            // Parse the octet
+            let mut octet = 0u32;
+            let octet_len = octet_end - pos;
+
+            for j in pos..octet_end {
+                if !CharacterClassifier::is_digit(text[j]) {
                     return false;
                 }
 
-                let mut octet = 0u32;
-                let mut digit_count = 0;
-
-                for j in num_start..i {
-                    if j >= text.len() {
-                        return false;
-                    }
-
-                    if !CharacterClassifier::is_digit(text[j]) {
-                        return false;
-                    }
-
-                    if digit_count == 0 && text[j] == b'0' && (i - num_start) > 1 {
-                        return false;
-                    }
-
-                    let digit = (text[j] - b'0') as u32;
-
-                    if octet > (255 - digit) / 10 {
-                        return false;
-                    }
-
-                    octet = octet * 10 + digit;
-                    digit_count += 1;
-                }
-
-                if octet > 255 {
+                // Leading zero check
+                if j == pos && text[j] == b'0' && octet_len > 1 {
                     return false;
                 }
 
-                octets.push(octet);
+                let digit = u32::from(text[j] - b'0');
 
-                if i >= text.len() {
-                    break;
+                // Overflow check
+                if octet > 25 || (octet == 25 && digit > 5) {
+                    return false;
                 }
 
-                num_start = i + 1;
-                if num_start > text.len() {
+                octet = octet * 10 + digit;
+            }
+
+            if octet > 255 {
+                return false;
+            }
+
+            octet_idx += 1;
+
+            // Move past the dot
+            pos = octet_end;
+            if pos < end && text[pos] == b'.' {
+                pos += 1;
+                // Trailing dot with no more octets is invalid
+                if pos == end {
                     return false;
                 }
             }
         }
 
-        if octets.len() != 4 {
-            return false;
-        }
-
-        if num_start == 0 || num_start - 1 != end {
-            return false;
-        }
-
-        true
+        // Must have exactly 4 octets AND consumed all input
+        octet_idx == 4 && pos == end
     }
 
+    /// Validates IPv6 address format
     fn validate_ipv6(text: &[u8], start: usize, end: usize) -> bool {
-        if start >= end {
+        if start >= end || end > text.len() {
             return false;
         }
 
-        let mut segment_count = 0;
+        let mut segment_count = 0i32;
         let mut has_compression = false;
         let mut pos = start;
-        let mut iterations = 0;
-        const MAX_IPV6_ITERATIONS: usize = 1000;
 
-        if (pos + 1) < end && text[pos] == b':' && text[pos + 1] == b':' {
+        const MAX_IPV6_ITERATIONS: usize = 1000;
+        let mut iterations = 0usize;
+
+        // Handle leading ::
+        if pos + 1 < end && text[pos] == b':' && text[pos + 1] == b':' {
             has_compression = true;
             pos += 2;
             if pos >= end {
@@ -448,7 +783,7 @@ impl DomainPartValidator {
             iterations += 1;
 
             let seg_start = pos;
-            let mut hex_digits = 0;
+            let mut hex_digits = 0u32;
 
             while pos < end && CharacterClassifier::is_hex_digit(text[pos]) {
                 hex_digits += 1;
@@ -464,23 +799,19 @@ impl DomainPartValidator {
                     return false;
                 }
 
+                // Check for embedded IPv4
                 if pos < end && text[pos] == b'.' {
                     if Self::validate_ipv4(text, seg_start, end) {
                         segment_count -= 1;
                         segment_count += 2;
                         break;
-                    } else {
-                        return false;
                     }
+                    return false;
                 }
             }
 
             if pos >= end {
                 break;
-            }
-
-            if pos >= text.len() {
-                return false;
             }
 
             if text[pos] == b':' {
@@ -490,16 +821,12 @@ impl DomainPartValidator {
                     if has_compression {
                         return false;
                     }
-
                     has_compression = true;
                     pos += 1;
-
                     if pos >= end {
                         break;
                     }
-                } else if hex_digits == 0 {
-                    return false;
-                } else if pos >= end {
+                } else if hex_digits == 0 || pos >= end {
                     return false;
                 }
             } else {
@@ -518,10 +845,9 @@ impl DomainPartValidator {
         }
     }
 
+    /// Validates IP literal format (e.g., [192.168.1.1] or [IPv6:...])
     fn validate_ip_literal(text: &[u8], start: usize, end: usize) -> bool {
-        let len = text.len();
-
-        if start >= end || end > len {
+        if start >= end || end > text.len() {
             return false;
         }
 
@@ -530,17 +856,19 @@ impl DomainPartValidator {
         }
 
         let ip_start = start + 1;
-        let ip_end = if end > 0 { end - 1 } else { return false };
+        let ip_end = end.saturating_sub(1);
 
-        if ip_start >= ip_end || ip_end > len {
+        if ip_start >= ip_end || ip_end > text.len() {
             return false;
         }
 
-        if (end - start) > 6 && (ip_start + 5) <= len {
+        // Check for IPv6 prefix
+        if (end - start) > 6 && (ip_start + 5) <= text.len() {
             let prefix = &text[ip_start..ip_start + 5];
-            if prefix[0] | 0x20 == b'i'
-                && prefix[1] | 0x20 == b'p'
-                && prefix[2] | 0x20 == b'v'
+
+            if (prefix[0] | 0x20) == b'i'
+                && (prefix[1] | 0x20) == b'p'
+                && (prefix[2] | 0x20) == b'v'
                 && prefix[3] == b'6'
                 && prefix[4] == b':'
             {
@@ -548,7 +876,7 @@ impl DomainPartValidator {
 
                 if addr_start < ip_end && text[addr_start] == b':' {
                     if (addr_start + 1) < ip_end && text[addr_start + 1] == b':' {
-                        // Keep addr_start at IPv6: position
+                        // Keep at IPv6: position
                     } else {
                         addr_start = ip_start + 4;
                     }
@@ -558,10 +886,12 @@ impl DomainPartValidator {
             }
         }
 
+        // Try IPv4
         if Self::validate_ipv4(text, ip_start, ip_end) {
             return true;
         }
 
+        // Reject if contains colon (malformed IPv6)
         for i in ip_start..ip_end {
             if text[i] == b':' {
                 return false;
@@ -571,32 +901,37 @@ impl DomainPartValidator {
         false
     }
 
-    fn validate(text: &[u8], start: usize, end: usize) -> bool {
+    /// Validates a domain part
+    #[must_use]
+    pub fn validate(text: &[u8], start: usize, end: usize) -> bool {
         if start >= end || end > text.len() {
             return false;
         }
 
         if text[start] == b'[' {
-            return Self::validate_ip_literal(text, start, end);
+            Self::validate_ip_literal(text, start, end)
+        } else {
+            Self::validate_domain_labels(text, start, end)
         }
-        Self::validate_domain_labels(text, start, end)
     }
 }
 
 // ============================================================================
-// EMAIL VALIDATOR
+// EMAIL VALIDATOR (Stateless - Thread-Safe)
 // ============================================================================
 
-struct RFC5322EmailValidator;
+pub struct EmailValidator;
 
-impl EmailValidator for RFC5322EmailValidator {
-    fn is_valid(&self, email: &str) -> bool {
-        const MIN_EMAIL_SIZE: usize = 5;
-        const MAX_EMAIL_SIZE: usize = 320;
+impl EmailValidator {
+    const MIN_EMAIL_SIZE: usize = 5;
+    const MAX_EMAIL_SIZE: usize = 320;
 
+    /// Validates an email address according to RFC 5322
+    #[must_use]
+    pub fn is_valid(email: &str) -> bool {
         let len = email.len();
 
-        if len < MIN_EMAIL_SIZE || len > MAX_EMAIL_SIZE {
+        if len < Self::MIN_EMAIL_SIZE || len > Self::MAX_EMAIL_SIZE {
             return false;
         }
 
@@ -640,46 +975,89 @@ impl EmailValidator for RFC5322EmailValidator {
 }
 
 // ============================================================================
-// OPERATION BATCHER (For Performance with Security Limits)
+// OPERATION LIMITER (Thread-Safe Resource Control)
 // ============================================================================
 
-struct OperationBatcher {
+/// Batch state for reducing atomic contention
+#[derive(Debug, Default)]
+pub struct BatchState {
     local_count: usize,
 }
 
-impl OperationBatcher {
+impl BatchState {
     const BATCH_SIZE: usize = 1000;
 
-    fn new() -> Self {
+    /// Creates a new batch state
+    #[must_use]
+    pub const fn new() -> Self {
         Self { local_count: 0 }
     }
+}
 
-    #[inline(always)]
-    fn record_operation(&mut self, counter: &AtomicUsize) {
-        self.local_count += 1;
-        if self.local_count >= Self::BATCH_SIZE {
-            counter.fetch_add(Self::BATCH_SIZE, Ordering::Relaxed);
-            self.local_count = 0;
+/// Thread-safe operation limiter with batched counting
+#[derive(Debug)]
+pub struct OperationLimiter {
+    operation_count: AtomicUsize,
+    max_operations: usize,
+}
+
+impl OperationLimiter {
+    /// Creates a new operation limiter with the specified maximum
+    #[must_use]
+    pub const fn new(max_ops: usize) -> Self {
+        Self {
+            operation_count: AtomicUsize::new(0),
+            max_operations: max_ops,
         }
     }
 
-    #[inline(always)]
-    fn check_limit(&mut self, counter: &AtomicUsize, max_ops: usize) -> bool {
-        self.record_operation(counter);
-        counter.load(Ordering::Relaxed) > max_ops
+    /// Records an operation using batched updates
+    /// Returns `true` if still within limits
+    #[inline]
+    pub fn record_operation(&self, batch: &mut BatchState) -> bool {
+        batch.local_count += 1;
+        if batch.local_count >= BatchState::BATCH_SIZE {
+            self.operation_count
+                .fetch_add(BatchState::BATCH_SIZE, Ordering::AcqRel);
+            batch.local_count = 0;
+        }
+        self.operation_count.load(Ordering::Acquire) <= self.max_operations
     }
 
-    fn flush(&self, counter: &AtomicUsize) {
-        if self.local_count > 0 {
-            counter.fetch_add(self.local_count, Ordering::Relaxed);
+    /// Flushes remaining batch count to the global counter
+    pub fn flush(&self, batch: &BatchState) {
+        if batch.local_count > 0 {
+            self.operation_count
+                .fetch_add(batch.local_count, Ordering::AcqRel);
         }
+    }
+
+    /// Checks if operations are within the limit
+    #[inline]
+    #[must_use]
+    pub fn is_within_limit(&self) -> bool {
+        self.operation_count.load(Ordering::Acquire) <= self.max_operations
+    }
+
+    /// Gets the current operation count
+    #[inline]
+    #[must_use]
+    pub fn get_count(&self) -> usize {
+        self.operation_count.load(Ordering::Acquire)
+    }
+
+    /// Resets the operation counter
+    pub fn reset(&self) {
+        self.operation_count.store(0, Ordering::Release);
     }
 }
 
 // ============================================================================
-// EMAIL SCANNER WITH HEURISTIC EXTRACTION + FULL SECURITY
+// EMAIL SCANNER (Stateless Core - Thread-Safe)
 // ============================================================================
 
+/// Email boundaries result from scanning
+#[derive(Debug, Clone, Copy)]
 struct EmailBoundaries {
     start: usize,
     end: usize,
@@ -688,10 +1066,10 @@ struct EmailBoundaries {
     did_trim_domain: bool,
 }
 
-struct HeuristicEmailScanner;
+/// Stateless email scanner for extraction from text
+pub struct EmailScanner;
 
-impl HeuristicEmailScanner {
-    // Security limits matching C++ implementation
+impl EmailScanner {
     const MAX_INPUT_SIZE: usize = 10 * 1024 * 1024;
     const MAX_LEFT_SCAN: usize = 4096;
     const MAX_EMAILS_EXTRACT: usize = 10000;
@@ -703,10 +1081,14 @@ impl HeuristicEmailScanner {
     const MAX_AT_SYMBOLS: usize = 1000;
     const MAX_SEEN_SET_SIZE: usize = 5000;
     const MAX_TOTAL_OPERATIONS: usize = 100_000_000;
+    const MAX_LOCAL_PART: usize = 64;
+    const MAX_DOMAIN_PART: usize = 255;
+    const MAX_LABEL_LENGTH: usize = 63;
     const MAX_SCAN_ITERATIONS: usize = 100_000;
     const MAX_TOTAL_CHARS_SCANNED: usize = 1_000_000;
 
-    #[inline(always)]
+    /// Finds the first alphanumeric character in range
+    #[inline]
     fn find_first_alnum(data: &[u8], pos: usize, limit: usize) -> Option<usize> {
         let limit = limit.min(data.len());
         for i in pos..limit {
@@ -717,7 +1099,8 @@ impl HeuristicEmailScanner {
         None
     }
 
-    #[inline(always)]
+    /// Finds the first atext character in range
+    #[inline]
     fn find_first_atext(data: &[u8], pos: usize, limit: usize) -> Option<usize> {
         let limit = limit.min(data.len());
         for i in pos..limit {
@@ -728,38 +1111,37 @@ impl HeuristicEmailScanner {
         None
     }
 
+    /// Finds email boundaries around an @ symbol
+    #[allow(clippy::cognitive_complexity)]
     fn find_email_boundaries(
-        text: &[u8],
+        data: &[u8],
+        len: usize,
         at_pos: usize,
         min_scanned_index: usize,
-        op_counter: &AtomicUsize,
-        batcher: &mut OperationBatcher,
+        limiter: &OperationLimiter,
+        batch: &mut BatchState,
     ) -> EmailBoundaries {
-        let len = text.len();
+        // Default invalid result
+        let invalid_result = EmailBoundaries {
+            start: at_pos,
+            end: at_pos,
+            valid_boundaries: false,
+            skip_to: at_pos,
+            did_trim_domain: false,
+        };
 
-        if batcher.check_limit(op_counter, Self::MAX_TOTAL_OPERATIONS) {
-            return EmailBoundaries {
-                start: at_pos,
-                end: at_pos,
-                valid_boundaries: false,
-                skip_to: at_pos,
-                did_trim_domain: false,
-            };
+        if !limiter.record_operation(batch) {
+            return invalid_result;
         }
 
         if at_pos >= len {
-            return EmailBoundaries {
-                start: at_pos,
-                end: at_pos,
-                valid_boundaries: false,
-                skip_to: at_pos,
-                did_trim_domain: false,
-            };
+            return invalid_result;
         }
 
         let mut end = at_pos + 1;
 
-        if end < len && text[end] == b'[' {
+        // Reject IP literals in scan mode
+        if end < len && data[end] == b'[' {
             return EmailBoundaries {
                 start: at_pos,
                 end: at_pos,
@@ -769,24 +1151,23 @@ impl HeuristicEmailScanner {
             };
         }
 
-        const MAX_DOMAIN_PART: usize = 255;
-        const MAX_LABEL_LENGTH: usize = 63;
+        // Scan domain part
         let mut domain_chars: usize = 0;
         let mut did_trim_domain = false;
         let mut current_label_length: usize = 0;
 
-        while end < len && CharacterClassifier::is_domain_char(text[end]) {
-            if domain_chars >= MAX_DOMAIN_PART {
-                end = at_pos + 1 + MAX_DOMAIN_PART;
+        while end < len && CharacterClassifier::is_domain_char(data[end]) {
+            if domain_chars >= Self::MAX_DOMAIN_PART {
+                end = at_pos + 1 + Self::MAX_DOMAIN_PART;
                 did_trim_domain = true;
                 break;
             }
 
-            if text[end] == b'.' {
+            if data[end] == b'.' {
                 current_label_length = 0;
             } else {
                 current_label_length += 1;
-                if current_label_length > MAX_LABEL_LENGTH {
+                if current_label_length > Self::MAX_LABEL_LENGTH {
                     did_trim_domain = true;
                 }
             }
@@ -794,63 +1175,54 @@ impl HeuristicEmailScanner {
             end += 1;
             domain_chars += 1;
 
-            batcher.record_operation(op_counter);
-            if op_counter.load(Ordering::Relaxed) > Self::MAX_TOTAL_OPERATIONS {
-                return EmailBoundaries {
-                    start: at_pos,
-                    end: at_pos,
-                    valid_boundaries: false,
-                    skip_to: at_pos,
-                    did_trim_domain: false,
-                };
+            if !limiter.record_operation(batch) {
+                return invalid_result;
             }
         }
 
-        while end > at_pos + 1 && text[end - 1] == b'.' {
+        // Trim trailing dots
+        while end > at_pos + 1 && data[end - 1] == b'.' {
             end -= 1;
         }
 
-        if end < len && text[end] == b'@' {
-            while end > at_pos + 1 && text[end - 1] == b'-' {
+        // Trim trailing hyphens if followed by @
+        if end < len && data[end] == b'@' {
+            while end > at_pos + 1 && data[end - 1] == b'-' {
                 end -= 1;
             }
         }
 
+        // Backward scan for local part
         let absolute_min = at_pos.saturating_sub(Self::MAX_LEFT_SCAN);
 
+        // Handle quoted local parts
         if at_pos > 0
-            && (text[at_pos - 1] == b'"' || text[at_pos - 1] == b'\'' || text[at_pos - 1] == b'`')
+            && (data[at_pos - 1] == b'"' || data[at_pos - 1] == b'\'' || data[at_pos - 1] == b'`')
         {
-            let closing_quote = text[at_pos - 1];
+            let closing_quote = data[at_pos - 1];
             let mut quotes_seen: usize = 0;
 
             if at_pos >= 2 {
-                for i in (absolute_min + 1..at_pos).rev() {
+                for i in ((absolute_min + 1)..at_pos).rev() {
                     if i < 1 {
                         break;
                     }
+
                     quotes_seen += 1;
 
-                    batcher.record_operation(op_counter);
-                    if op_counter.load(Ordering::Relaxed) > Self::MAX_TOTAL_OPERATIONS {
-                        return EmailBoundaries {
-                            start: at_pos,
-                            end: at_pos,
-                            valid_boundaries: false,
-                            skip_to: at_pos,
-                            did_trim_domain: false,
-                        };
+                    if !limiter.record_operation(batch) {
+                        return invalid_result;
                     }
 
                     if quotes_seen > Self::MAX_QUOTE_SCAN {
                         break;
                     }
 
-                    if text[i] == closing_quote {
+                    if data[i] == closing_quote {
                         let valid_boundary = if i == 0 || i == absolute_min {
                             true
-                        } else if i > 0 {
-                            let prev_char = text[i - 1];
+                        } else {
+                            let prev_char = data[i - 1];
                             CharacterClassifier::is_scan_boundary(prev_char)
                                 || prev_char == b' '
                                 || prev_char == b'='
@@ -862,13 +1234,11 @@ impl HeuristicEmailScanner {
                                 || prev_char == b'\r'
                                 || prev_char == b'\n'
                                 || CharacterClassifier::is_invalid_local_char(prev_char)
-                        } else {
-                            false
                         };
 
                         if valid_boundary && (at_pos - i) >= 3 {
                             let right_boundary_valid = if end < len {
-                                let next_char = text[end];
+                                let next_char = data[end];
                                 CharacterClassifier::is_scan_right_boundary(next_char)
                                     || next_char == b'\''
                                     || next_char == b'`'
@@ -900,6 +1270,7 @@ impl HeuristicEmailScanner {
             }
         }
 
+        // Standard backward scan
         let effective_min = min_scanned_index.max(absolute_min);
         let mut start = at_pos;
         let mut hit_invalid_char = false;
@@ -909,70 +1280,51 @@ impl HeuristicEmailScanner {
         let mut chars_scanned: usize = 0;
 
         while start > effective_min && start > 0 && chars_scanned < Self::MAX_BACKWARD_SCAN_CHARS {
-            batcher.record_operation(op_counter);
-            if op_counter.load(Ordering::Relaxed) > Self::MAX_TOTAL_OPERATIONS {
-                return EmailBoundaries {
-                    start: at_pos,
-                    end: at_pos,
-                    valid_boundaries: false,
-                    skip_to: at_pos,
-                    did_trim_domain: false,
-                };
+            if !limiter.record_operation(batch) {
+                return invalid_result;
             }
 
-            let prev_char = text[start - 1];
+            let prev_char = data[start - 1];
 
             if prev_char == b'@' {
                 break;
             }
 
-            if prev_char == b'.' && start > 1 && start > effective_min + 1 {
-                if text[start - 2] == b'.' {
-                    hit_invalid_char = true;
-                    invalid_char_pos = start - 1;
-                    break;
-                }
+            if prev_char == b'.'
+                && start > 1
+                && start > effective_min + 1
+                && data[start - 2] == b'.'
+            {
+                hit_invalid_char = true;
+                invalid_char_pos = start - 1;
+                break;
             }
 
             if CharacterClassifier::is_invalid_local_char(prev_char) {
                 if prev_char == b'@' && start > 1 && start > effective_min + 1 {
                     let mut lookback = start - 2;
+                    let mut valid_start = start - 1;
                     let mut found_valid = false;
-                    let lookback_limit = effective_min;
-                    let mut lookback_iterations: usize = 0;
                     const MAX_LOOKBACK_ITERATIONS: usize = 100;
+                    let mut lookback_iterations: usize = 0;
 
-                    loop {
-                        if lookback < lookback_limit
-                            || lookback >= at_pos
-                            || lookback >= len
-                            || lookback_iterations >= MAX_LOOKBACK_ITERATIONS
-                        {
-                            break;
+                    while lookback >= effective_min
+                        && lookback < at_pos
+                        && lookback < len
+                        && lookback_iterations < MAX_LOOKBACK_ITERATIONS
+                    {
+                        if !limiter.record_operation(batch) {
+                            return invalid_result;
                         }
 
-                        batcher.record_operation(op_counter);
-                        if op_counter.load(Ordering::Relaxed) > Self::MAX_TOTAL_OPERATIONS {
-                            return EmailBoundaries {
-                                start: at_pos,
-                                end: at_pos,
-                                valid_boundaries: false,
-                                skip_to: at_pos,
-                                did_trim_domain: false,
-                            };
-                        }
-
-                        let c = text[lookback];
+                        let c = data[lookback];
                         if CharacterClassifier::is_atext(c) && c != b'.' {
                             found_valid = true;
-                            start = lookback;
-                            if lookback == lookback_limit || lookback == 0 {
+                            valid_start = lookback;
+                            if lookback == effective_min || lookback == 0 {
                                 break;
                             }
-                            if lookback == 0 {
-                                break;
-                            }
-                            lookback -= 1;
+                            lookback = lookback.saturating_sub(1);
                             lookback_iterations += 1;
                             continue;
                         }
@@ -980,6 +1332,8 @@ impl HeuristicEmailScanner {
                     }
 
                     if found_valid {
+                        start = valid_start;
+                        chars_scanned += 1;
                         continue;
                     }
                 }
@@ -990,14 +1344,14 @@ impl HeuristicEmailScanner {
             }
 
             if CharacterClassifier::is_quote_char(prev_char) {
-                if start > 1 && start > effective_min + 1 && text[start - 2] == prev_char {
+                if start > 1 && start > effective_min + 1 && data[start - 2] == prev_char {
                     start -= 1;
                     chars_scanned += 1;
                     continue;
                 }
 
-                let has_matching_quote = if end < len && text[end] == prev_char {
-                    if end + 1 < len && text[end + 1] == prev_char {
+                let has_matching_quote = if end < len && data[end] == prev_char {
+                    if end + 1 < len && data[end + 1] == prev_char {
                         start -= 1;
                         chars_scanned += 1;
                         continue;
@@ -1011,7 +1365,7 @@ impl HeuristicEmailScanner {
                     break;
                 } else {
                     if start > 1 && start > effective_min + 1 {
-                        let prev_prev_char = text[start - 2];
+                        let prev_prev_char = data[start - 2];
                         if prev_prev_char == b'='
                             || prev_prev_char == b':'
                             || CharacterClassifier::is_scan_boundary(prev_prev_char)
@@ -1031,9 +1385,7 @@ impl HeuristicEmailScanner {
                 }
             }
 
-            if prev_char == b'.' {
-                start -= 1;
-            } else if CharacterClassifier::is_atext(prev_char) {
+            if prev_char == b'.' || CharacterClassifier::is_atext(prev_char) {
                 start -= 1;
             } else {
                 break;
@@ -1042,14 +1394,15 @@ impl HeuristicEmailScanner {
             chars_scanned += 1;
         }
 
+        // Recovery from invalid characters
         if hit_invalid_char {
             if let Some(recovery_pos) =
-                Self::find_first_alnum(text, invalid_char_pos.max(effective_min), at_pos)
+                Self::find_first_alnum(data, invalid_char_pos.max(effective_min), at_pos)
             {
                 start = recovery_pos;
                 did_recovery = true;
             } else if let Some(recovery_pos) =
-                Self::find_first_atext(text, invalid_char_pos.max(effective_min), at_pos)
+                Self::find_first_atext(data, invalid_char_pos.max(effective_min), at_pos)
             {
                 start = recovery_pos;
                 did_recovery = true;
@@ -1065,14 +1418,16 @@ impl HeuristicEmailScanner {
             }
         }
 
-        while start < at_pos && text[start] == b'.' {
+        // Trim leading dots
+        while start < at_pos && data[start] == b'.' {
             start += 1;
         }
 
+        // Additional cleanup
         if start < at_pos && start > effective_min && start > 0 {
-            let char_before_start = text[start - 1];
+            let char_before_start = data[start - 1];
             if CharacterClassifier::is_invalid_local_char(char_before_start) {
-                if let Some(first_alnum) = Self::find_first_alnum(text, start, at_pos) {
+                if let Some(first_alnum) = Self::find_first_alnum(data, start, at_pos) {
                     start = first_alnum;
                 }
             }
@@ -1089,16 +1444,18 @@ impl HeuristicEmailScanner {
             };
         }
 
-        const MAX_LOCAL_PART: usize = 64;
-        if (at_pos - start) > MAX_LOCAL_PART {
+        // Enforce local part length limit
+        if (at_pos - start) > Self::MAX_LOCAL_PART {
             did_trim = true;
-            start = at_pos.saturating_sub(MAX_LOCAL_PART);
+            start = at_pos.saturating_sub(Self::MAX_LOCAL_PART);
 
-            while start < at_pos && text[start] == b'.' {
+            while start < at_pos && data[start] == b'.' {
                 start += 1;
             }
 
-            if let Some(&prev_char) = text.get(start.wrapping_sub(1)) {
+            if start > effective_min && start > 0 {
+                let prev_char = data[start - 1];
+
                 if !CharacterClassifier::is_scan_boundary(prev_char)
                     && !CharacterClassifier::is_invalid_local_char(prev_char)
                     && prev_char != b'@'
@@ -1109,11 +1466,11 @@ impl HeuristicEmailScanner {
                     && prev_char != b'"'
                     && prev_char != b'/'
                 {
-                    if let Some(first_valid) = Self::find_first_alnum(text, start, at_pos) {
+                    if let Some(first_valid) = Self::find_first_alnum(data, start, at_pos) {
                         if first_valid < at_pos {
                             start = first_valid;
                         }
-                    } else if let Some(first_valid) = Self::find_first_atext(text, start, at_pos) {
+                    } else if let Some(first_valid) = Self::find_first_atext(data, start, at_pos) {
                         if first_valid < at_pos {
                             start = first_valid;
                         }
@@ -1121,18 +1478,21 @@ impl HeuristicEmailScanner {
                 }
             }
 
-            if (at_pos - start) > MAX_LOCAL_PART {
-                start = at_pos - MAX_LOCAL_PART;
+            if (at_pos - start) > Self::MAX_LOCAL_PART {
+                start = at_pos - Self::MAX_LOCAL_PART;
             }
 
-            while start < at_pos && text[start] == b'.' {
+            while start < at_pos && data[start] == b'.' {
                 start += 1;
             }
         }
 
+        // Boundary validation
         let mut valid_boundaries = true;
 
-        if let Some(&prev_char) = text.get(start.wrapping_sub(1)) {
+        if start > effective_min && start > 0 {
+            let prev_char = data[start - 1];
+
             if did_trim {
                 valid_boundaries = true;
             } else if did_recovery {
@@ -1156,7 +1516,7 @@ impl HeuristicEmailScanner {
                 && start > effective_min + 1
                 && start >= 2
             {
-                let prev_prev_char = text[start - 2];
+                let prev_prev_char = data[start - 2];
                 if CharacterClassifier::is_scan_boundary(prev_prev_char)
                     || prev_prev_char == b'='
                     || prev_prev_char == b':'
@@ -1167,14 +1527,15 @@ impl HeuristicEmailScanner {
             }
 
             if !did_trim && prev_char == b'/' && start > effective_min + 1 && start >= 2 {
-                if text[start - 2] == b'/' {
+                if data[start - 2] == b'/' {
                     valid_boundaries = true;
                 }
             }
         }
 
+        // Right boundary validation
         if end < len && valid_boundaries && !did_trim_domain {
-            let next_char = text[end];
+            let next_char = data[end];
             if !CharacterClassifier::is_scan_right_boundary(next_char)
                 && next_char != b'\''
                 && next_char != b'`'
@@ -1195,32 +1556,32 @@ impl HeuristicEmailScanner {
             did_trim_domain,
         }
     }
-}
 
-impl EmailScanner for HeuristicEmailScanner {
-    fn contains(&self, text: &str) -> bool {
+    /// Checks if text contains at least one valid email address
+    #[must_use]
+    pub fn contains(text: &str) -> bool {
         let len = text.len();
 
         if len > Self::MAX_INPUT_SIZE || len < 5 {
             return false;
         }
 
-        let bytes = text.as_bytes();
+        let data = text.as_bytes();
         let mut pos: usize = 0;
         let min_scanned_index: usize = 0;
         let last_consumed_end: usize = 0;
 
-        let total_ops = AtomicUsize::new(0);
-        let mut batcher = OperationBatcher::new();
+        let limiter = OperationLimiter::new(Self::MAX_TOTAL_OPERATIONS);
+        let mut batch = BatchState::new();
 
         let mut total_chars_scanned: usize = 0;
 
         while pos < len {
-            if batcher.check_limit(&total_ops, Self::MAX_TOTAL_OPERATIONS) {
+            if !limiter.is_within_limit() {
                 break;
             }
 
-            let at_pos = match bytes[pos..].iter().position(|&b| b == b'@') {
+            let at_pos = match data[pos..].iter().position(|&b| b == b'@') {
                 Some(offset) => pos + offset,
                 None => break,
             };
@@ -1236,22 +1597,26 @@ impl EmailScanner for HeuristicEmailScanner {
             }
 
             let boundaries = Self::find_email_boundaries(
-                bytes,
+                data,
+                len,
                 at_pos,
                 min_scanned_index,
-                &total_ops,
-                &mut batcher,
+                &limiter,
+                &mut batch,
             );
 
-            let chars_scanned: usize = (at_pos.saturating_sub(boundaries.start))
-                .saturating_add(boundaries.end.saturating_sub(at_pos));
+            let chars_scanned = safe_arithmetic::saturating_add(
+                safe_arithmetic::saturating_subtract(at_pos, boundaries.start),
+                safe_arithmetic::saturating_subtract(boundaries.end, at_pos),
+            );
 
             if chars_scanned > Self::MAX_BACKTRACK_PER_AT {
                 pos = at_pos + 1;
                 continue;
             }
 
-            total_chars_scanned = total_chars_scanned.saturating_add(chars_scanned);
+            total_chars_scanned =
+                safe_arithmetic::saturating_add(total_chars_scanned, chars_scanned);
             if total_chars_scanned > Self::MAX_TOTAL_CHARS_SCANNED {
                 break;
             }
@@ -1267,29 +1632,32 @@ impl EmailScanner for HeuristicEmailScanner {
 
             let mode = if boundaries.start < at_pos
                 && boundaries.start < len
-                && text.as_bytes()[boundaries.start] == b'"'
+                && data[boundaries.start] == b'"'
             {
                 ValidationMode::Exact
             } else {
                 ValidationMode::Scan
             };
 
-            let local_valid = LocalPartValidator::validate(bytes, boundaries.start, at_pos, mode);
+            let local_valid = LocalPartValidator::validate(data, boundaries.start, at_pos, mode);
             let domain_valid = boundaries.did_trim_domain
-                || DomainPartValidator::validate(bytes, at_pos + 1, boundaries.end);
+                || DomainPartValidator::validate(data, at_pos + 1, boundaries.end);
 
             if local_valid && domain_valid {
+                limiter.flush(&batch);
                 return true;
             }
 
             pos = at_pos + 1;
         }
 
-        batcher.flush(&total_ops);
+        limiter.flush(&batch);
         false
     }
 
-    fn extract(&self, text: &str) -> Vec<String> {
+    /// Extracts all valid email addresses from text
+    #[must_use]
+    pub fn extract(text: &str) -> Vec<String> {
         let len = text.len();
 
         if len > Self::MAX_INPUT_SIZE || len < 5 {
@@ -1297,7 +1665,6 @@ impl EmailScanner for HeuristicEmailScanner {
         }
 
         let initial_reserve = Self::MAX_INITIAL_RESERVE.min(len / 30).min(10);
-
         let mut emails = Vec::with_capacity(initial_reserve);
 
         let expected_unique = (len / 30)
@@ -1308,26 +1675,24 @@ impl EmailScanner for HeuristicEmailScanner {
             .min(Self::MAX_SEEN_SET_SIZE);
         let mut seen = HashSet::with_capacity(reserve_size);
 
-        let bytes = text.as_bytes();
+        let data = text.as_bytes();
         let mut pos: usize = 0;
         let mut min_scanned_index: usize = 0;
         let mut last_consumed_end: usize = 0;
-
         let mut extracted_count: usize = 0;
         let mut at_symbols_processed: usize = 0;
 
-        let total_ops = AtomicUsize::new(0);
-        let mut batcher = OperationBatcher::new();
+        let limiter = OperationLimiter::new(Self::MAX_TOTAL_OPERATIONS);
+        let mut batch = BatchState::new();
 
         let mut iterations: usize = 0;
         let mut total_chars_scanned: usize = 0;
-
         let mut estimated_memory: usize = 0;
 
         while pos < len && iterations < Self::MAX_SCAN_ITERATIONS {
             iterations += 1;
 
-            if batcher.check_limit(&total_ops, Self::MAX_TOTAL_OPERATIONS) {
+            if !limiter.is_within_limit() {
                 break;
             }
 
@@ -1339,7 +1704,7 @@ impl EmailScanner for HeuristicEmailScanner {
                 break;
             }
 
-            let at_pos = match bytes[pos..].iter().position(|&b| b == b'@') {
+            let at_pos = match data[pos..].iter().position(|&b| b == b'@') {
                 Some(offset) => pos + offset,
                 None => break,
             };
@@ -1357,22 +1722,26 @@ impl EmailScanner for HeuristicEmailScanner {
             }
 
             let boundaries = Self::find_email_boundaries(
-                bytes,
+                data,
+                len,
                 at_pos,
                 min_scanned_index,
-                &total_ops,
-                &mut batcher,
+                &limiter,
+                &mut batch,
             );
 
-            let chars_scanned: usize = (at_pos.saturating_sub(boundaries.start))
-                .saturating_add(boundaries.end.saturating_sub(at_pos));
+            let chars_scanned = safe_arithmetic::saturating_add(
+                safe_arithmetic::saturating_subtract(at_pos, boundaries.start),
+                safe_arithmetic::saturating_subtract(boundaries.end, at_pos),
+            );
 
             if chars_scanned > Self::MAX_BACKTRACK_PER_AT {
                 pos = at_pos + 1;
                 continue;
             }
 
-            total_chars_scanned = total_chars_scanned.saturating_add(chars_scanned);
+            total_chars_scanned =
+                safe_arithmetic::saturating_add(total_chars_scanned, chars_scanned);
             if total_chars_scanned > Self::MAX_TOTAL_CHARS_SCANNED {
                 break;
             }
@@ -1388,16 +1757,16 @@ impl EmailScanner for HeuristicEmailScanner {
 
             let mode = if boundaries.start < at_pos
                 && boundaries.start < len
-                && text.as_bytes()[boundaries.start] == b'"'
+                && data[boundaries.start] == b'"'
             {
                 ValidationMode::Exact
             } else {
                 ValidationMode::Scan
             };
 
-            let local_valid = LocalPartValidator::validate(bytes, boundaries.start, at_pos, mode);
+            let local_valid = LocalPartValidator::validate(data, boundaries.start, at_pos, mode);
             let domain_valid = boundaries.did_trim_domain
-                || DomainPartValidator::validate(bytes, at_pos + 1, boundaries.end);
+                || DomainPartValidator::validate(data, at_pos + 1, boundaries.end);
 
             if local_valid && domain_valid {
                 if boundaries.start >= text.len()
@@ -1410,11 +1779,11 @@ impl EmailScanner for HeuristicEmailScanner {
 
                 let email = &text[boundaries.start..boundaries.end];
 
-                let email_memory: usize = email.len()
+                let email_memory = email.len()
                     + std::mem::size_of::<String>()
                     + std::mem::size_of::<*const ()>() * 2;
 
-                let new_memory: usize = estimated_memory.saturating_add(email_memory);
+                let new_memory = safe_arithmetic::saturating_add(estimated_memory, email_memory);
                 if new_memory > Self::MAX_MEMORY_BUDGET {
                     break;
                 }
@@ -1424,19 +1793,18 @@ impl EmailScanner for HeuristicEmailScanner {
                 }
 
                 if emails.len() >= emails.capacity() {
-                    let new_capacity = emails.len() + 1;
-                    let additional_memory: usize = new_capacity * std::mem::size_of::<String>();
-
-                    let capacity_memory: usize = new_memory.saturating_add(additional_memory);
-                    if capacity_memory > Self::MAX_MEMORY_BUDGET {
+                    let additional_memory = (emails.len() + 1) * std::mem::size_of::<String>();
+                    if safe_arithmetic::saturating_add(new_memory, additional_memory)
+                        > Self::MAX_MEMORY_BUDGET
+                    {
                         break;
                     }
-
                     emails.reserve(1);
                 }
 
-                if seen.insert(email.to_string()) {
-                    emails.push(email.to_string());
+                let email_string = email.to_string();
+                if seen.insert(email_string.clone()) {
+                    emails.push(email_string);
                     estimated_memory = new_memory;
                     extracted_count += 1;
                 }
@@ -1444,15 +1812,16 @@ impl EmailScanner for HeuristicEmailScanner {
                 min_scanned_index = min_scanned_index.max(boundaries.start);
                 last_consumed_end = last_consumed_end.max(boundaries.end);
 
+                // Check for adjacent emails
                 if boundaries.end < len {
-                    let next_char = bytes[boundaries.end];
+                    let next_char = data[boundaries.end];
 
                     if CharacterClassifier::is_atext(next_char) || next_char == b'.' {
                         let mut found_nearby_at = false;
                         let look_limit = (boundaries.end + 65).min(len);
 
                         for look in boundaries.end..look_limit {
-                            if bytes[look] == b'@' {
+                            if data[look] == b'@' {
                                 found_nearby_at = true;
                                 break;
                             }
@@ -1472,25 +1841,230 @@ impl EmailScanner for HeuristicEmailScanner {
             pos = at_pos + 1;
         }
 
-        batcher.flush(&total_ops);
+        limiter.flush(&batch);
         emails
     }
 }
 
 // ============================================================================
-// FACTORY
+// TRAITS FOR ABSTRACTION (SOLID: Interface Segregation)
 // ============================================================================
 
-struct EmailValidatorFactory;
+/// Trait for email validation
+pub trait EmailValidate: Send + Sync {
+    /// Validates an email address
+    fn is_valid(&self, email: &str) -> bool;
+}
 
-impl EmailValidatorFactory {
-    fn create_validator() -> Box<dyn EmailValidator> {
-        Box::new(RFC5322EmailValidator)
+/// Trait for email scanning/extraction
+pub trait EmailScan: Send + Sync {
+    /// Checks if text contains at least one valid email
+    fn contains(&self, text: &str) -> bool;
+    /// Extracts all valid emails from text
+    fn extract(&self, text: &str) -> Vec<String>;
+}
+
+// ============================================================================
+// EMAIL VALIDATION SERVICE (Thread-Safe Instance)
+// ============================================================================
+
+/// Thread-safe email validation service with statistics tracking
+pub struct EmailValidationService {
+    stats: ValidationStats,
+}
+
+impl Default for EmailValidationService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EmailValidationService {
+    /// Creates a new validation service
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            stats: ValidationStats::new(),
+        }
     }
 
-    fn create_scanner() -> Box<dyn EmailScanner> {
-        Box::new(HeuristicEmailScanner)
+    /// Validates an email and records statistics
+    #[must_use]
+    pub fn validate(&self, email: &str) -> bool {
+        self.stats.record_validation();
+        let result = EmailValidator::is_valid(email);
+        if !result {
+            self.stats.record_error();
+        }
+        result
     }
+
+    /// Gets a reference to the statistics
+    #[must_use]
+    pub const fn get_stats(&self) -> &ValidationStats {
+        &self.stats
+    }
+
+    /// Resets the statistics
+    pub fn reset_stats(&self) {
+        self.stats.reset();
+    }
+}
+
+impl EmailValidate for EmailValidationService {
+    fn is_valid(&self, email: &str) -> bool {
+        self.validate(email)
+    }
+}
+
+// ============================================================================
+// EMAIL SCANNER SERVICE (Thread-Safe Instance)
+// ============================================================================
+
+/// Thread-safe email scanner service with statistics tracking
+pub struct EmailScannerService {
+    stats: ValidationStats,
+}
+
+impl Default for EmailScannerService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl EmailScannerService {
+    /// Creates a new scanner service
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            stats: ValidationStats::new(),
+        }
+    }
+
+    /// Checks if text contains an email and records statistics
+    #[must_use]
+    pub fn contains(&self, text: &str) -> bool {
+        self.stats.record_scan();
+        let result = EmailScanner::contains(text);
+        if !result {
+            self.stats.record_error();
+        }
+        result
+    }
+
+    /// Extracts emails and records statistics
+    #[must_use]
+    pub fn extract(&self, text: &str) -> Vec<String> {
+        self.stats.record_extract();
+        let result = EmailScanner::extract(text);
+        if result.is_empty() {
+            self.stats.record_error();
+        }
+        result
+    }
+
+    /// Gets a reference to the statistics
+    #[must_use]
+    pub const fn get_stats(&self) -> &ValidationStats {
+        &self.stats
+    }
+
+    /// Resets the statistics
+    pub fn reset_stats(&self) {
+        self.stats.reset();
+    }
+}
+
+impl EmailScan for EmailScannerService {
+    fn contains(&self, text: &str) -> bool {
+        EmailScannerService::contains(self, text)
+    }
+
+    fn extract(&self, text: &str) -> Vec<String> {
+        EmailScannerService::extract(self, text)
+    }
+}
+
+// ============================================================================
+// FACTORY (Thread-Safe Service Creation)
+// ============================================================================
+
+/// Factory for creating email services
+pub struct EmailServiceFactory;
+
+impl EmailServiceFactory {
+    /// Creates a new validation service instance
+    #[must_use]
+    pub fn create_validation_service() -> EmailValidationService {
+        EmailValidationService::new()
+    }
+
+    /// Creates a new scanner service instance
+    #[must_use]
+    pub fn create_scanner_service() -> EmailScannerService {
+        EmailScannerService::new()
+    }
+
+    /// Creates a shared (Arc-wrapped) validation service for concurrent use
+    #[must_use]
+    pub fn create_shared_validation_service() -> Arc<EmailValidationService> {
+        Arc::new(EmailValidationService::new())
+    }
+
+    /// Creates a shared (Arc-wrapped) scanner service for concurrent use
+    #[must_use]
+    pub fn create_shared_scanner_service() -> Arc<EmailScannerService> {
+        Arc::new(EmailScannerService::new())
+    }
+
+    /// Gets a thread-local validation service (for convenience)
+    /// Each thread gets its own service instance with independent statistics
+    pub fn with_thread_local_validation_service<F, R>(f: F) -> R
+    where
+        F: FnOnce(&EmailValidationService) -> R,
+    {
+        thread_local! {
+            static SERVICE: EmailValidationService = EmailValidationService::new();
+        }
+        SERVICE.with(f)
+    }
+
+    /// Gets a thread-local scanner service (for convenience)
+    /// Each thread gets its own service instance with independent statistics
+    pub fn with_thread_local_scanner_service<F, R>(f: F) -> R
+    where
+        F: FnOnce(&EmailScannerService) -> R,
+    {
+        thread_local! {
+            static SERVICE: EmailScannerService = EmailScannerService::new();
+        }
+        SERVICE.with(f)
+    }
+}
+
+// ============================================================================
+// CONVENIENCE FUNCTIONS (For Simple Use Cases)
+// ============================================================================
+
+/// Validates an email address (convenience function)
+#[inline]
+#[must_use]
+pub fn is_valid_email(email: &str) -> bool {
+    EmailValidator::is_valid(email)
+}
+
+/// Checks if text contains a valid email (convenience function)
+#[inline]
+#[must_use]
+pub fn text_contains_email(text: &str) -> bool {
+    EmailScanner::contains(text)
+}
+
+/// Extracts all valid emails from text (convenience function)
+#[inline]
+#[must_use]
+pub fn extract_emails(text: &str) -> Vec<String> {
+    EmailScanner::extract(text)
 }
 
 // ============================================================================
@@ -1516,7 +2090,7 @@ fn run_exact_validation_tests() {
     println!("{}", "=".repeat(100));
     println!("Full RFC 5322 compliance with quoted strings, IP literals, etc.\n");
 
-    let validator = EmailValidatorFactory::create_validator();
+    let validator = EmailServiceFactory::create_validation_service();
 
     let tests = vec![
         // Standard formats
@@ -1689,7 +2263,7 @@ fn run_exact_validation_tests() {
             description: "IPv4 Boundary IP Address".to_string(),
         },
         TestCase {
-            input: r#""spaces are allowed"@[10.1.2.3]"#.to_string(), // C++: R"("spaces are allowed"@[10.1.2.3])"
+            input: r#""spaces are allowed"@[10.1.2.3]"#.to_string(),
             expected: true,
             description: "IPv4 with space in local-part inside quotes".to_string(),
         },
@@ -2117,7 +2691,7 @@ fn run_text_scanning_tests() {
     println!("{}", "=".repeat(100));
     println!("Conservative validation for PII detection\n");
 
-    let scanner = EmailValidatorFactory::create_scanner();
+    let scanner = EmailServiceFactory::create_scanner_service();
 
     let json_string = r#"{
         "type": "service_account",
@@ -3854,7 +4428,7 @@ fn run_performance_benchmark() {
             let valid_count_clone = Arc::clone(&valid_count);
 
             threads.push(thread::spawn(move || {
-                let local_validator = EmailValidatorFactory::create_validator();
+                let local_validator = EmailServiceFactory::create_validation_service();
                 let mut local_valid = 0;
 
                 for _ in 0..iterations_per_thread {
@@ -3907,7 +4481,7 @@ fn run_performance_benchmark() {
             let found_count_clone = Arc::clone(&found_count);
 
             threads.push(thread::spawn(move || {
-                let local_scanner = EmailValidatorFactory::create_scanner();
+                let local_scanner = EmailServiceFactory::create_scanner_service();
                 let mut local_found = 0;
 
                 for _ in 0..iterations_per_thread {
@@ -3957,7 +4531,7 @@ fn run_performance_benchmark() {
             let extracted_count_clone = Arc::clone(&extracted_count);
 
             threads.push(thread::spawn(move || {
-                let local_scanner = EmailValidatorFactory::create_scanner();
+                let local_scanner = EmailServiceFactory::create_scanner_service();
                 let mut local_extracted = 0;
 
                 for _ in 0..iterations_per_thread {
@@ -4009,8 +4583,8 @@ fn run_performance_benchmark() {
             let total_operations_clone = Arc::clone(&total_operations);
 
             threads.push(thread::spawn(move || {
-                let local_validator = EmailValidatorFactory::create_validator();
-                let local_scanner = EmailValidatorFactory::create_scanner();
+                let local_validator = EmailServiceFactory::create_validation_service();
+                let local_scanner = EmailServiceFactory::create_scanner_service();
                 let mut local_ops = 0;
 
                 for _ in 0..iterations_per_thread {
@@ -4075,7 +4649,7 @@ fn main() {
     println!("{}", "=".repeat(100));
     println!("Testing both exact validation and text scanning\n");
 
-    let scanner = EmailValidatorFactory::create_scanner();
+    let scanner = EmailServiceFactory::create_scanner_service();
 
     let test_cases = vec![
         "Simple email: user@example.com in text",
